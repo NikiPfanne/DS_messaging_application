@@ -1,0 +1,2 @@
+# No external dependencies required - using Python standard library only
+# This ensures minimal setup and maximum portability
