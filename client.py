@@ -232,18 +232,48 @@ def main():
                     break
                 
                 elif command == 'send':
+                    # Supported forms (prefer explicitness to avoid ambiguity):
+                    # send <message...>                      -> broadcast
+                    # send all <message...>                  -> broadcast
+                    # send * <message...>                    -> broadcast
+                    # send to <recipient> <message...>       -> private
+                    # send @<recipient> <message...>         -> private
                     if len(parts) < 2:
-                        print("Usage: send <message> or send <recipient> <message>")
+                        print("Usage: send <message...> | send all <message...> | send to <recipient> <message...> | send @<recipient> <message...>")
                         continue
-                    
-                    if len(parts) == 2:
-                        # Broadcast message
-                        client.send_message(parts[1])
-                    else:
-                        # Private message
-                        recipient = parts[1]
-                        message = parts[2]
-                        client.send_message(message, recipient)
+
+                    # Explicit broadcast keywords
+                    if parts[1].lower() in ('all', '*'):
+                        msg_text = " ".join(parts[2:]).strip()
+                        if not msg_text:
+                            print("Usage: send all <message...>")
+                            continue
+                        client.send_message(msg_text)
+                        continue
+
+                    # Explicit private: 'to <recipient> <msg>'
+                    if parts[1].lower() == 'to':
+                        if len(parts) < 4:
+                            print("Usage: send to <recipient> <message...>")
+                            continue
+                        recipient = parts[2]
+                        msg_text = " ".join(parts[3:]).strip()
+                        client.send_message(msg_text, recipient)
+                        continue
+
+                    # Explicit private: '@recipient <msg>'
+                    if parts[1].startswith('@'):
+                        recipient = parts[1][1:]
+                        msg_text = " ".join(parts[2:]).strip()
+                        if not recipient or not msg_text:
+                            print("Usage: send @<recipient> <message...>")
+                            continue
+                        client.send_message(msg_text, recipient)
+                        continue
+
+                    # Default: treat as broadcast to allow messages with spaces
+                    msg_text = " ".join(parts[1:]).strip()
+                    client.send_message(msg_text)
                 
                 else:
                     print(f"Unknown command: {command}")
