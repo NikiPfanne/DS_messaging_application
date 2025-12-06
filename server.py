@@ -48,6 +48,7 @@ class Server:
         self.current_leader = None
         self.election_in_progress = False
         self.election_initiator = None
+        self.leader_lock = threading.Lock()  # Protect leader state
         
         # Client management
         self.clients: Dict[str, socket.socket] = {}
@@ -225,7 +226,7 @@ class Server:
                 self.logger.info(f"Client {client_id} disconnected")
             try:
                 client_socket.close()
-            except:
+            except (OSError, socket.error):
                 pass
     
     def _recv_exactly(self, sock: socket.socket, n: int) -> Optional[bytes]:
@@ -274,7 +275,7 @@ class Server:
                     msg = ClientMessage(sender, content)
                     self._send_message(self.clients[recipient], msg)
                     self.logger.info(f"Delivered message from {sender} to {recipient}")
-                except Exception as e:
+                except (socket.error, OSError) as e:
                     self.logger.error(f"Failed to deliver to {recipient}: {e}")
             else:
                 # Message will be queued or forwarded
@@ -284,10 +285,13 @@ class Server:
         """Send periodic heartbeats via UDP multicast"""
         while self.is_running:
             try:
+                with self.leader_lock:
+                    is_leader = self.is_leader
+                
                 heartbeat = HeartbeatMessage(
                     self.server_id,
                     self.tcp_port,
-                    self.is_leader,
+                    is_leader,
                     len(self.clients)
                 )
                 
@@ -344,9 +348,10 @@ class Server:
                 'load': msg.payload.get('load', 0)
             }
             
-            # Update leader information
+            # Update leader information if needed
             if msg.payload.get('is_leader'):
-                self.current_leader = server_id
+                with self.leader_lock:
+                    self.current_leader = server_id
     
     def _failure_detector(self):
         """Detect failed servers based on missed heartbeats"""
@@ -355,6 +360,7 @@ class Server:
             
             current_time = time.time()
             failed_servers = []
+            leader_failed = False
             
             with self.servers_lock:
                 for server_id, info in list(self.known_servers.items()):
@@ -365,20 +371,24 @@ class Server:
             if failed_servers:
                 self.logger.warning(f"Detected failed servers: {failed_servers}")
                 
-                # If leader failed, start election
-                if self.current_leader in failed_servers:
+                # Check if leader failed
+                with self.leader_lock:
+                    if self.current_leader in failed_servers:
+                        leader_failed = True
+                        self.current_leader = None
+                        self.is_leader = False
+                
+                if leader_failed:
                     self.logger.warning("Leader failed, initiating election")
-                    self.current_leader = None
-                    self.is_leader = False
                     self._initiate_election()
     
     def _initiate_election(self):
         """Initiate leader election using LeLann-Chang-Roberts algorithm"""
-        if self.election_in_progress:
-            return
-        
-        self.election_in_progress = True
-        self.election_initiator = self.server_id
+        with self.leader_lock:
+            if self.election_in_progress:
+                return
+            self.election_in_progress = True
+            self.election_initiator = self.server_id
         
         self.logger.info("Initiating leader election")
         
@@ -447,9 +457,10 @@ class Server:
     
     def _become_leader(self):
         """Become the leader and announce"""
-        self.is_leader = True
-        self.current_leader = self.server_id
-        self.election_in_progress = False
+        with self.leader_lock:
+            self.is_leader = True
+            self.current_leader = self.server_id
+            self.election_in_progress = False
         
         self.logger.info(f"Server {self.server_id} became LEADER")
         
@@ -467,21 +478,42 @@ class Server:
     def _handle_leader_announcement(self, msg: Message):
         """Handle leader announcement"""
         leader_id = msg.payload.get('leader_id')
-        self.current_leader = leader_id
-        self.election_in_progress = False
         
-        if leader_id != self.server_id:
-            self.is_leader = False
-            self.logger.info(f"Acknowledged {leader_id} as leader")
+        with self.leader_lock:
+            self.current_leader = leader_id
+            self.election_in_progress = False
+            
+            if leader_id != self.server_id:
+                self.is_leader = False
+                self.logger.info(f"Acknowledged {leader_id} as leader")
+            else:
+                self.logger.info(f"Confirmed as leader")
     
     def _election_timeout(self):
         """Handle election timeout"""
         time.sleep(self.ELECTION_TIMEOUT)
         
-        if self.election_in_progress:
-            # If still in election, become leader by default
-            self.logger.warning("Election timeout, becoming leader")
-            self._become_leader()
+        with self.leader_lock:
+            if self.election_in_progress:
+                # If still in election, become leader by default
+                self.logger.warning("Election timeout, becoming leader")
+                # Don't call _become_leader here to avoid nested locks
+                self.is_leader = True
+                self.current_leader = self.server_id
+                self.election_in_progress = False
+        
+        self.logger.info(f"Server {self.server_id} became LEADER (timeout)")
+        
+        # Announce leadership outside the lock
+        announcement = LeaderAnnouncementMessage(self.server_id, self.server_id)
+        msg_data = announcement.to_json().encode('utf-8')
+        try:
+            self.udp_socket.sendto(
+                msg_data,
+                (self.MULTICAST_GROUP, self.MULTICAST_PORT)
+            )
+        except (PermissionError, OSError):
+            pass
     
     def get_status(self) -> dict:
         """Get server status"""
@@ -491,14 +523,19 @@ class Server:
         with self.servers_lock:
             num_servers = len(self.known_servers)
         
+        with self.leader_lock:
+            is_leader = self.is_leader
+            current_leader = self.current_leader
+            election_in_progress = self.election_in_progress
+        
         return {
             'server_id': self.server_id,
             'tcp_port': self.tcp_port,
-            'is_leader': self.is_leader,
-            'current_leader': self.current_leader,
+            'is_leader': is_leader,
+            'current_leader': current_leader,
             'connected_clients': num_clients,
             'known_servers': num_servers,
-            'election_in_progress': self.election_in_progress
+            'election_in_progress': election_in_progress
         }
 
 

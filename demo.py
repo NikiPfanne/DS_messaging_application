@@ -98,9 +98,11 @@ Press Ctrl+C to stop all servers
                 proc.terminate()
                 proc.wait(timeout=2)
                 print(f"Stopped {server_id}")
-            except:
+            except subprocess.TimeoutExpired:
                 proc.kill()
                 print(f"Killed {server_id}")
+            except (OSError, subprocess.SubprocessError) as e:
+                print(f"Error stopping {server_id}: {e}")
         
         print("\nAll servers stopped.")
         print("Demo complete!")

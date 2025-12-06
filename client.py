@@ -74,13 +74,13 @@ class Client:
                 # Send unregister message
                 unreg_msg = Message(MessageType.CLIENT_UNREGISTER, self.client_id)
                 self._send_message(unreg_msg)
-            except:
+            except (socket.error, OSError):
                 pass
         
         if self.socket:
             try:
                 self.socket.close()
-            except:
+            except (socket.error, OSError):
                 pass
         
         self.is_connected = False
