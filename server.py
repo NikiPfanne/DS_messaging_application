@@ -115,18 +115,28 @@ class Server:
     
     def _setup_udp_socket(self):
         """Setup UDP multicast socket for server coordination"""
-        self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        
-        # Bind to multicast port
-        self.udp_socket.bind(('', self.MULTICAST_PORT))
-        
-        # Join multicast group
-        mreq = struct.pack("4sl", socket.inet_aton(self.MULTICAST_GROUP), socket.INADDR_ANY)
-        self.udp_socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-        
-        # Allow sending multicast messages
-        self.udp_socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        try:
+            self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            
+            # Bind to multicast port
+            self.udp_socket.bind(('', self.MULTICAST_PORT))
+            
+            # Join multicast group
+            mreq = struct.pack("4sl", socket.inet_aton(self.MULTICAST_GROUP), socket.INADDR_ANY)
+            self.udp_socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            
+            # Allow sending multicast messages
+            self.udp_socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+            
+            self.logger.info("UDP multicast enabled")
+        except Exception as e:
+            self.logger.warning(f"Could not setup UDP multicast: {e}")
+            self.logger.warning("Running in single-server mode (coordination disabled)")
+            # Create a dummy socket that won't actually work for multicast
+            # but won't crash the application
+            self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.udp_socket.bind(('127.0.0.1', 0))  # Bind to localhost on random port
     
     def _start_threads(self):
         """Start all background threads"""
@@ -282,15 +292,19 @@ class Server:
                 )
                 
                 msg_data = heartbeat.to_json().encode('utf-8')
-                self.udp_socket.sendto(
-                    msg_data,
-                    (self.MULTICAST_GROUP, self.MULTICAST_PORT)
-                )
+                try:
+                    self.udp_socket.sendto(
+                        msg_data,
+                        (self.MULTICAST_GROUP, self.MULTICAST_PORT)
+                    )
+                except PermissionError:
+                    # Multicast not available in this environment
+                    pass
                 
                 time.sleep(self.HEARTBEAT_INTERVAL)
             except Exception as e:
                 if self.is_running:
-                    self.logger.error(f"Error sending heartbeat: {e}")
+                    self.logger.debug(f"Heartbeat sender error: {e}")
     
     def _heartbeat_receiver(self):
         """Receive heartbeats from other servers via UDP multicast"""
@@ -376,10 +390,16 @@ class Server:
         )
         
         msg_data = election_msg.to_json().encode('utf-8')
-        self.udp_socket.sendto(
-            msg_data,
-            (self.MULTICAST_GROUP, self.MULTICAST_PORT)
-        )
+        try:
+            self.udp_socket.sendto(
+                msg_data,
+                (self.MULTICAST_GROUP, self.MULTICAST_PORT)
+            )
+        except (PermissionError, OSError):
+            # Multicast not available, become leader immediately
+            self.logger.warning("Multicast not available, becoming leader")
+            self._become_leader()
+            return
         
         # Start election timeout
         threading.Thread(target=self._election_timeout, daemon=True).start()
@@ -402,10 +422,13 @@ class Server:
                 initiator_id
             )
             msg_data = election_msg.to_json().encode('utf-8')
-            self.udp_socket.sendto(
-                msg_data,
-                (self.MULTICAST_GROUP, self.MULTICAST_PORT)
-            )
+            try:
+                self.udp_socket.sendto(
+                    msg_data,
+                    (self.MULTICAST_GROUP, self.MULTICAST_PORT)
+                )
+            except (PermissionError, OSError):
+                pass
         # If our ID is greater, substitute it
         elif self.server_id > candidate_id:
             election_msg = LeaderElectionMessage(
@@ -414,10 +437,13 @@ class Server:
                 initiator_id
             )
             msg_data = election_msg.to_json().encode('utf-8')
-            self.udp_socket.sendto(
-                msg_data,
-                (self.MULTICAST_GROUP, self.MULTICAST_PORT)
-            )
+            try:
+                self.udp_socket.sendto(
+                    msg_data,
+                    (self.MULTICAST_GROUP, self.MULTICAST_PORT)
+                )
+            except (PermissionError, OSError):
+                pass
     
     def _become_leader(self):
         """Become the leader and announce"""
@@ -430,10 +456,13 @@ class Server:
         # Announce leadership
         announcement = LeaderAnnouncementMessage(self.server_id, self.server_id)
         msg_data = announcement.to_json().encode('utf-8')
-        self.udp_socket.sendto(
-            msg_data,
-            (self.MULTICAST_GROUP, self.MULTICAST_PORT)
-        )
+        try:
+            self.udp_socket.sendto(
+                msg_data,
+                (self.MULTICAST_GROUP, self.MULTICAST_PORT)
+            )
+        except (PermissionError, OSError):
+            pass
     
     def _handle_leader_announcement(self, msg: Message):
         """Handle leader announcement"""
