@@ -111,6 +111,9 @@ class Server:
         """Setup TCP socket for client connections"""
         self.tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.tcp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Bind to all interfaces (0.0.0.0) to accept connections from any network interface
+        # This is intentional for a distributed system where servers need to be accessible
+        # from multiple clients across different networks
         self.tcp_socket.bind(('0.0.0.0', self.tcp_port))
         self.tcp_socket.listen(self.max_clients)
     
@@ -120,7 +123,9 @@ class Server:
             self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             
-            # Bind to multicast port
+            # Bind to multicast port on all interfaces (empty string means all interfaces)
+            # This is required for UDP multicast to work across different network interfaces
+            # in a distributed server environment
             self.udp_socket.bind(('', self.MULTICAST_PORT))
             
             # Join multicast group

@@ -189,12 +189,26 @@ Tests cover:
 
 ## Security Considerations
 
-This is an educational implementation. For production use, consider:
-- Authentication and authorization
-- Encrypted communications (TLS/SSL)
-- Message integrity checks
-- Rate limiting and DoS protection
-- Input validation and sanitization
+This is an educational implementation demonstrating distributed systems concepts. For production use, consider:
+
+### Network Security
+- **Bind to all interfaces**: The server binds to `0.0.0.0` and uses UDP multicast on all interfaces. This is intentional for a distributed system but should be restricted in production environments using firewalls or network segmentation
+- **Authentication and authorization**: Implement client authentication and message authorization
+- **Encrypted communications**: Use TLS/SSL for TCP connections and encrypt UDP multicast messages
+- **Message integrity checks**: Add HMAC or digital signatures to prevent tampering
+
+### Application Security
+- **Rate limiting and DoS protection**: Implement connection and message rate limits
+- **Input validation and sanitization**: Validate all message content and metadata
+- **Resource limits**: Enforce maximum message size, client connections, and memory usage
+- **Audit logging**: Log all security-relevant events for monitoring and forensics
+
+### Deployment Recommendations
+- Deploy servers in a trusted network segment
+- Use firewall rules to restrict access to specific IP ranges
+- Monitor for unusual traffic patterns or connection attempts
+- Implement TLS/SSL certificates for production deployments
+- Consider using VPN or private networks for server-to-server communication
 
 ## Troubleshooting
 
