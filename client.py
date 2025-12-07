@@ -212,9 +212,11 @@ def main():
     
     print(f"Connected as {client_id}")
     print("Commands:")
-    print("  send <message>          - Send broadcast message")
-    print("  send <recipient> <msg>  - Send private message")
-    print("  quit                    - Exit")
+    print("  send <message...>              - Broadcast")
+    print("  send all|* <message...>        - Broadcast")
+    print("  send to <recipient> <message...> - Private")
+    print("  send @<recipient> <message...>  - Private")
+    print("  quit                            - Exit")
     print()
     
     try:
@@ -225,7 +227,7 @@ def main():
                 if not user_input.strip():
                     continue
                 
-                parts = user_input.strip().split(None, 2)
+                parts = user_input.strip().split()
                 command = parts[0].lower()
                 
                 if command == 'quit':
@@ -253,11 +255,14 @@ def main():
 
                     # Explicit private: 'to <recipient> <msg>'
                     if parts[1].lower() == 'to':
-                        if len(parts) < 4:
+                        if len(parts) < 3:
                             print("Usage: send to <recipient> <message...>")
                             continue
                         recipient = parts[2]
                         msg_text = " ".join(parts[3:]).strip()
+                        if not msg_text:
+                            print("Usage: send to <recipient> <message...>")
+                            continue
                         client.send_message(msg_text, recipient)
                         continue
 
