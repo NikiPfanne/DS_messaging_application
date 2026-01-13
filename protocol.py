@@ -7,7 +7,7 @@ import json
 import time
 from typing import Dict, Any, Optional
 from enum import Enum
-
+import uuid
 
 class MessageType(Enum):
     """Types of messages in the system"""
@@ -38,7 +38,8 @@ class Message:
         self.sender_id = sender_id
         self.payload = payload or {}
         self.timestamp = time.time()
-        self.message_id = f"{sender_id}_{self.timestamp}"
+        self.message_id = str(uuid.uuid4())
+
     
     def to_json(self) -> str:
         """Serialize message to JSON string"""

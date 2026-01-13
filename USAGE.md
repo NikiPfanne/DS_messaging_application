@@ -22,14 +22,18 @@ Clients (TCP) <---> Servers <---> Servers (UDP Multicast)
 ## Components
 
 ### 1. Protocol (`protocol.py`)
+
 Defines message types and serialization for:
+
 - Client-server communication (TCP)
 - Server-server coordination (UDP multicast)
 - Leader election messages
 - Heartbeat and fault detection
 
 ### 2. Server (`server.py`)
+
 Features:
+
 - TCP socket for client connections
 - UDP multicast for server coordination
 - LeLann-Chang-Roberts leader election
@@ -39,14 +43,18 @@ Features:
 - Message routing and delivery
 
 ### 3. Client (`client.py`)
+
 Features:
+
 - TCP connection to any server
 - Send broadcast or private messages
 - Receive messages asynchronously
 - Interactive command-line interface
 
 ### 4. Configuration (`config.py`)
+
 System-wide configuration including:
+
 - Multicast group and port
 - Timing parameters
 - Capacity limits
@@ -69,6 +77,7 @@ python server.py server3 5003
 ```
 
 Servers will automatically:
+
 - Discover each other via UDP multicast
 - Elect a leader using LeLann-Chang-Roberts
 - Monitor each other with heartbeats
@@ -112,17 +121,21 @@ The system uses the **LeLann-Chang-Roberts** algorithm:
 5. Leader announces itself to all servers
 
 ### Election Properties
+
 - **Ring-based**: Messages circulate through all servers
 - **ID-based**: Server with highest ID becomes leader
 - **Crash-tolerant**: Re-election triggered on leader failure
 
 ## Heartbeat and Fault Detection
 
-### Heartbeat Mechanism
-- Every server sends heartbeat every 2 seconds via UDP multicast
-- Heartbeat contains: server_id, port, is_leader, load
+### Heartbeat Mechanism (who sends to who)
+
+- **Every server sends** a heartbeat periodically (default: every 2s) to the **UDP multicast group** `224.0.0.1:5007`.
+- **Every server listens** on the same multicast group and receives heartbeats from **all other servers** (all-to-all via multicast).
+- Each received heartbeat updates the local `known_servers` table (last_seen timestamp, sender port, leader flag, load).
 
 ### Failure Detection
+
 - Server considered failed after 3 missed heartbeats (6 seconds)
 - If leader fails: automatic re-election
 - If follower fails: removed from known servers list
@@ -130,11 +143,13 @@ The system uses the **LeLann-Chang-Roberts** algorithm:
 ## Load Balancing
 
 Servers share load information in heartbeats:
+
 - Number of connected clients
 - Current capacity
 - Leader status
 
 This allows:
+
 - Clients to choose least-loaded server
 - Dynamic redistribution of load
 - Better resource utilization
@@ -148,6 +163,7 @@ python test_messaging.py
 ```
 
 Tests cover:
+
 - Message serialization/deserialization
 - Protocol correctness
 - Server and client basics
@@ -156,12 +172,14 @@ Tests cover:
 ## Example Scenarios
 
 ### Scenario 1: Normal Operation
+
 1. Start 3 servers (server1, server2, server3)
 2. Servers elect server3 as leader (highest ID)
 3. Connect clients to different servers
 4. Clients can message each other regardless of which server they're connected to
 
 ### Scenario 2: Leader Failure
+
 1. Start 3 servers, server3 becomes leader
 2. Stop server3 (Ctrl+C)
 3. Other servers detect failure after 6 seconds
@@ -169,6 +187,7 @@ Tests cover:
 5. System continues operating normally
 
 ### Scenario 3: Load Balancing
+
 1. Start 3 servers
 2. Connect 10 clients to server1
 3. New clients can check server loads and connect to less-loaded servers
@@ -177,11 +196,22 @@ Tests cover:
 ## Network Configuration
 
 ### TCP (Client-Server)
+
 - Each server listens on a unique port (e.g., 5001, 5002, 5003)
 - Clients connect to any available server
 - Reliable, connection-oriented communication
 
+#### Client group communication over TCP (overlay broadcast)
+
+- TCP is **point-to-point**. There is no “TCP multicast”.
+- **Client broadcast** is implemented as **server fan-out**: the server iterates over all connected TCP client sockets and sends the message to each one (application-level overlay broadcast).
+
 ### UDP Multicast (Server-Server)
+
+#### Server coordination over UDP multicast
+
+- Server discovery, heartbeats, and leader election run over **UDP multicast** (`224.0.0.1:5007`) so that **one send reaches all servers**.
+
 - Multicast group: 224.0.0.1
 - Multicast port: 5007
 - Servers send/receive: heartbeats, election messages, announcements
@@ -192,18 +222,21 @@ Tests cover:
 This is an educational implementation demonstrating distributed systems concepts. For production use, consider:
 
 ### Network Security
+
 - **Bind to all interfaces**: The server binds to `0.0.0.0` and uses UDP multicast on all interfaces. This is intentional for a distributed system but should be restricted in production environments using firewalls or network segmentation
 - **Authentication and authorization**: Implement client authentication and message authorization
 - **Encrypted communications**: Use TLS/SSL for TCP connections and encrypt UDP multicast messages
 - **Message integrity checks**: Add HMAC or digital signatures to prevent tampering
 
 ### Application Security
+
 - **Rate limiting and DoS protection**: Implement connection and message rate limits
 - **Input validation and sanitization**: Validate all message content and metadata
 - **Resource limits**: Enforce maximum message size, client connections, and memory usage
 - **Audit logging**: Log all security-relevant events for monitoring and forensics
 
 ### Deployment Recommendations
+
 - Deploy servers in a trusted network segment
 - Use firewall rules to restrict access to specific IP ranges
 - Monitor for unusual traffic patterns or connection attempts
@@ -213,16 +246,19 @@ This is an educational implementation demonstrating distributed systems concepts
 ## Troubleshooting
 
 ### Servers not discovering each other
+
 - Check firewall settings for UDP multicast
 - Ensure multicast is enabled on network interface
 - Try running on same machine with localhost
 
 ### Clients cannot connect
+
 - Verify server is running and port is correct
 - Check firewall rules for TCP connections
 - Ensure server is accepting connections (not at max capacity)
 
 ### Leader election not working
+
 - Check UDP multicast is functioning
 - Verify server IDs are unique and comparable
 - Check logs for election messages
@@ -238,6 +274,7 @@ This is an educational implementation demonstrating distributed systems concepts
 ## Future Enhancements
 
 Possible improvements:
+
 - Message persistence and delivery guarantees
 - Server-side message queuing
 - Multi-leader support for partitioned networks
