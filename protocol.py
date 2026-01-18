@@ -33,13 +33,12 @@ class MessageType(Enum):
 class Message:
     """Base message class for all communication"""
     
-    def __init__(self, msg_type: MessageType, sender_id: str, payload: Dict[str, Any] = None):
+    def __init__(self, msg_type: MessageType, sender_id: str, payload: Dict[str, Any] = None, message_id: str = None):
         self.msg_type = msg_type
         self.sender_id = sender_id
         self.payload = payload or {}
         self.timestamp = time.time()
-        self.message_id = str(uuid.uuid4())
-
+        self.message_id = message_id or str(uuid.uuid4())
     
     def to_json(self) -> str:
         """Serialize message to JSON string"""
@@ -91,14 +90,13 @@ class Message:
 
 
 class ClientMessage(Message):
-    """Message from client to server"""
-    
-    def __init__(self, sender_id: str, content: str, recipient: Optional[str] = None):
-        payload = {
-            'content': content,
-            'recipient': recipient
-        }
-        super().__init__(MessageType.CLIENT_MESSAGE, sender_id, payload)
+    def __init__(self, sender_id: str, content: str, recipient: Optional[str] = None,
+                 seq: Optional[int] = None, message_id: Optional[str] = None):
+        payload = {'content': content, 'recipient': recipient}
+        if seq is not None:
+            payload['seq'] = seq
+        super().__init__(MessageType.CLIENT_MESSAGE, sender_id, payload, message_id=message_id)
+
 
 
 class ServerResponse(Message):
