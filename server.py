@@ -8,6 +8,7 @@ from protocol import (
     Message, MessageType, HeartbeatMessage, LeaderElectionMessage,
     LeaderAnnouncementMessage, ServerResponse, ClientMessage
 )
+import uuid
 
 logging.basicConfig(
     level=logging.INFO,
@@ -277,14 +278,16 @@ class Server:
 
         self.logger.info(f"Message from {msg.sender_id}: {content}")
 
-        # Send acknowledgment
-        response = ServerResponse(
+        # After processing: send explicit ACK for chat message
+        ack = Message(
+            MessageType.MESSAGE_ACK,
             self.server_id,
-            True,
-            "Message received",
-            {'message_id': msg.message_id}
+            {
+                'acked_message_id': msg.message_id,
+                'status': 'PROCESSED'
+            }
         )
-        self._send_message(client_socket, response)
+        self._send_message(client_socket, ack)
 
         # If recipient specified, deliver directly, otherwise broadcast to all
         if recipient:
@@ -295,7 +298,7 @@ class Server:
     def _deliver_message(self, sender: str, recipient: str, content: str, msg_id: str = None):
         """Deliver message to recipient (local or via another server)"""
         if msg_id is None:
-            msg_id = Message(MessageType.MESSAGE_ACK, self.server_id).message_id
+            msg_id = str(uuid.uuid4())
 
 
         forwarded = False
@@ -345,7 +348,7 @@ class Server:
         other servers still receive).
         """
         if msg_id is None:
-            msg_id = Message(MessageType.MESSAGE_ACK, self.server_id).message_id
+            msg_id = str(uuid.uuid4())
 
 
         with self.client_lock:
