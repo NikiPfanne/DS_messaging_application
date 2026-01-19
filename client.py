@@ -6,6 +6,9 @@ Features:
 - Receive messages asynchronously
 - Per-client sequencing (seq) for FIFO (useful for forwarded ordering)
 - Explicit MESSAGE_ACK handling (server confirms processing)
+- Automatic reconnect on TCP failure (BrokenPipe/ConnectionReset)
+- UDP multicast discovery (SERVER_DISCOVERY / SERVER_ANNOUNCE) to get assigned server from leader
+- Resend of unacknowledged (pending) messages after reconnect (same message_id + seq)
 """
 
 import socket
@@ -13,7 +16,7 @@ import threading
 import logging
 import time
 import uuid
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
 
 from protocol import Message, MessageType, ClientMessage
 
@@ -24,39 +27,63 @@ logging.basicConfig(
 
 
 class Client:
+    # Must match server.py
+    MULTICAST_GROUP = "224.0.0.1"
+    MULTICAST_PORT = 5007
+
+    DISCOVERY_TIMEOUT = 2.0       # seconds to wait for SERVER_ANNOUNCE
+    RECONNECT_BACKOFF = 1.0       # seconds between reconnect attempts
+    MAX_MESSAGE_SIZE = 1024 * 1024
+
     def __init__(self, client_id: str, server_host: str, server_port: int):
         self.client_id = client_id
         self.server_host = server_host
         self.server_port = server_port
 
         self.sock: Optional[socket.socket] = None
+        self.sock_lock = threading.Lock()
+
         self.is_running = False
 
         # Sequencing for FIFO per sender
         self.seq = 0
 
-        # Track pending messages awaiting ACK: message_id -> timestamp
-        self.pending: Dict[str, float] = {}
+        # message_id -> {content, recipient, seq, ts}
+        self.pending: Dict[str, dict] = {}
         self.pending_lock = threading.Lock()
+
+        self.receiver_thread: Optional[threading.Thread] = None
+        self.reconnect_lock = threading.Lock()
 
         self.logger = logging.getLogger(f"Client-{client_id}")
 
-    def connect(self):
-        """Connect to server and register."""
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.connect((self.server_host, self.server_port))
-        self.is_running = True
+    # ----------------------------
+    # Connection / lifecycle
+    # ----------------------------
+    def connect(self, start_receiver: bool = True):
+        """Connect to server and register. Does NOT start a new receiver thread unless start_receiver=True."""
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect((self.server_host, self.server_port))
+        s.settimeout(None)
+
+        with self.sock_lock:
+            # close old socket if any
+            if self.sock:
+                try:
+                    self.sock.close()
+                except Exception:
+                    pass
+            self.sock = s
 
         # Register
         reg = Message(MessageType.CLIENT_REGISTER, self.client_id, {})
-        self._send(reg)
+        self._send_raw(reg)
 
         # Wait for server response (registration)
         resp = self._recv_message()
         if not resp:
             raise RuntimeError("No response from server during registration")
 
-        # Could be ServerResponse OR other message; print something readable
         if resp.msg_type == MessageType.SERVER_RESPONSE:
             ok = resp.payload.get("success", False)
             msg = resp.payload.get("message", "")
@@ -68,24 +95,28 @@ class Client:
             self.logger.info(f"Connected; got {resp.msg_type.value}")
             print(f"Connected as {self.client_id}")
 
-        # Start receiver thread
-        t = threading.Thread(target=self._receiver_loop, daemon=True)
-        t.start()
+        if start_receiver:
+            self.is_running = True
+            self.receiver_thread = threading.Thread(target=self._receiver_loop, daemon=True)
+            self.receiver_thread.start()
 
     def close(self):
         self.is_running = False
         try:
-            if self.sock:
-                unreg = Message(MessageType.CLIENT_UNREGISTER, self.client_id, {})
-                self._send(unreg)
+            with self.sock_lock:
+                if self.sock:
+                    try:
+                        unreg = Message(MessageType.CLIENT_UNREGISTER, self.client_id, {})
+                        self._send_raw(unreg)
+                    except Exception:
+                        pass
+                    try:
+                        self.sock.close()
+                    except Exception:
+                        pass
+                    self.sock = None
         except Exception:
             pass
-        try:
-            if self.sock:
-                self.sock.close()
-        except Exception:
-            pass
-        self.sock = None
 
     def run_cli(self):
         """Interactive command loop."""
@@ -117,18 +148,14 @@ class Client:
 
         self.close()
 
+    # ----------------------------
+    # Sending
+    # ----------------------------
     def _handle_send_command(self, line: str):
         parts = line.split()
         if len(parts) < 2:
             print("Usage: send <message...> | send to <recipient> <message...> | send @<recipient> <message...>")
             return
-
-        # Cases:
-        # send <msg...>  (broadcast)
-        # send all <msg...> (broadcast)
-        # send * <msg...> (broadcast)
-        # send to bob <msg...> (private)
-        # send @bob <msg...> (private)
 
         recipient = None
         msg_text = None
@@ -166,66 +193,98 @@ class Client:
         )
 
         with self.pending_lock:
-            self.pending[message_id] = time.time()
+            self.pending[message_id] = {
+                "content": content,
+                "recipient": recipient,
+                "seq": self.seq,
+                "ts": time.time(),
+            }
 
         self._send(msg)
 
+    def _send(self, msg: Message):
+        """Send with reconnect-on-failure."""
+        data = msg.to_bytes()
+        try:
+            with self.sock_lock:
+                if not self.sock:
+                    raise ConnectionError("Not connected")
+                self.sock.sendall(data)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError, ConnectionError) as e:
+            self.logger.warning(f"Send failed ({e}); reconnecting...")
+            self._handle_disconnect()
+            # retry once after reconnect
+            with self.sock_lock:
+                if not self.sock:
+                    raise ConnectionError("Reconnect failed")
+                self.sock.sendall(data)
+
+    def _send_raw(self, msg: Message):
+        """Send without auto-reconnect (used during connect/register)."""
+        data = msg.to_bytes()
+        with self.sock_lock:
+            if not self.sock:
+                raise RuntimeError("Not connected")
+            self.sock.sendall(data)
+
+    # ----------------------------
+    # Receiving
+    # ----------------------------
     def _receiver_loop(self):
-        """Receive messages until socket closes."""
+        """Receive messages; auto-reconnect on socket failure."""
         while self.is_running:
             try:
                 msg = self._recv_message()
                 if not msg:
-                    break
+                    self.logger.warning("Connection lost; reconnecting...")
+                    self._handle_disconnect()
+                    continue
 
                 if msg.msg_type == MessageType.MESSAGE_ACK:
                     acked_id = msg.payload.get("acked_message_id")
                     if acked_id:
                         with self.pending_lock:
-                            if acked_id in self.pending:
-                                self.pending.pop(acked_id, None)
+                            self.pending.pop(acked_id, None)
                         self.logger.info(f"ACK received for message {acked_id}")
                     continue
 
                 if msg.msg_type == MessageType.CLIENT_MESSAGE:
                     sender = msg.sender_id
                     content = msg.payload.get("content", "")
-                    # print incoming message nicely
                     print(f"\n[{sender}] {content}")
-                    # re-print prompt
                     print(f"{self.client_id}> ", end="", flush=True)
                     continue
 
                 if msg.msg_type == MessageType.SERVER_RESPONSE:
-                    # optional: server responses
                     message = msg.payload.get("message", "")
                     print(f"\n[server] {message}")
                     print(f"{self.client_id}> ", end="", flush=True)
                     continue
 
-                # fallback
                 print(f"\n[info] Received {msg.msg_type.value}: {msg.payload}")
                 print(f"{self.client_id}> ", end="", flush=True)
 
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError) as e:
+                if self.is_running:
+                    self.logger.warning(f"Receiver socket error ({e}); reconnecting...")
+                    self._handle_disconnect()
+                    continue
             except Exception as e:
                 if self.is_running:
                     self.logger.error(f"Receiver error: {e}")
-                break
+                time.sleep(0.2)
 
         self.is_running = False
 
-    def _send(self, msg: Message):
-        if not self.sock:
-            raise RuntimeError("Not connected")
-        data = msg.to_bytes()
-        self.sock.sendall(data)
-
     def _recv_exactly(self, n: int) -> Optional[bytes]:
-        if not self.sock:
+        with self.sock_lock:
+            s = self.sock
+        if not s:
             return None
+
         data = b""
         while len(data) < n:
-            chunk = self.sock.recv(n - len(data))
+            chunk = s.recv(n - len(data))
             if not chunk:
                 return None
             data += chunk
@@ -236,14 +295,160 @@ class Client:
         if not length_data:
             return None
         length = int.from_bytes(length_data, byteorder="big")
-        if length <= 0 or length > 1024 * 1024:
+        if length <= 0 or length > self.MAX_MESSAGE_SIZE:
             return None
         payload = self._recv_exactly(length)
         if not payload:
             return None
         return Message.from_json(payload.decode("utf-8"))
 
+    # ----------------------------
+    # Reconnect + Discovery + Resend
+    # ----------------------------
+    def _handle_disconnect(self):
+        """Close current TCP socket, discover assigned server via multicast, reconnect, resend pending."""
+        # Ensure only one reconnect runs at a time
+        with self.reconnect_lock:
+            # close current socket
+            with self.sock_lock:
+                if self.sock:
+                    try:
+                        self.sock.close()
+                    except Exception:
+                        pass
+                    self.sock = None
 
+            # best-effort loop until reconnected or client stops
+            while self.is_running:
+                try:
+                    host, port = self.discover_assigned_server()
+                    if host and port:
+                        self.server_host, self.server_port = host, port
+                        self.logger.info(f"Reconnecting to assigned server {host}:{port}...")
+                    else:
+                        self.logger.warning("Discovery failed; retrying with last known server...")
+
+                    # reconnect + register (do NOT start a second receiver thread)
+                    self.connect(start_receiver=False)
+
+                    # resend pending messages (same message_id + seq)
+                    self._resend_pending()
+
+                    self.logger.info("Reconnected successfully.")
+                    # refresh prompt if user is typing
+                    print(f"\n[info] Reconnected to {self.server_host}:{self.server_port}")
+                    print(f"{self.client_id}> ", end="", flush=True)
+                    return
+
+                except Exception as e:
+                    self.logger.warning(f"Reconnect attempt failed: {e}")
+                    time.sleep(self.RECONNECT_BACKOFF)
+
+    def discover_assigned_server(self) -> Tuple[Optional[str], Optional[int]]:
+        """
+        Send SERVER_DISCOVERY over UDP multicast and wait for SERVER_ANNOUNCE.
+        Expects leader to answer with:
+          assigned_host, assigned_tcp_port, assigned_server_id, leader_id
+        """
+        # Create UDP socket for multicast send/recv
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        except Exception:
+            pass
+
+        # Try to bind to multicast port so we can receive SERVER_ANNOUNCE sent to the group.
+        # On some Windows setups this can fail if something is strict; fallback to ephemeral port (may miss announce).
+        bound = False
+        try:
+            s.bind(("", self.MULTICAST_PORT))
+            bound = True
+        except OSError:
+            s.bind(("", 0))
+            bound = False
+
+        # Join multicast group (only useful if bound to multicast port)
+        if bound:
+            try:
+                mreq = socket.inet_aton(self.MULTICAST_GROUP) + socket.inet_aton("0.0.0.0")
+                s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            except Exception:
+                pass
+
+        s.settimeout(self.DISCOVERY_TIMEOUT)
+
+        discovery = Message(
+            MessageType.SERVER_DISCOVERY,
+            self.client_id,
+            {
+                "ts": time.time()
+            }
+        )
+
+        # Send discovery to multicast group
+        try:
+            s.sendto(discovery.to_json().encode("utf-8"), (self.MULTICAST_GROUP, self.MULTICAST_PORT))
+        except Exception as e:
+            self.logger.warning(f"Discovery send failed: {e}")
+            try:
+                s.close()
+            except Exception:
+                pass
+            return None, None
+
+        # Wait for announce
+        try:
+            data, addr = s.recvfrom(4096)
+            msg = Message.from_json(data.decode("utf-8"))
+            if msg.msg_type != MessageType.SERVER_ANNOUNCE:
+                return None, None
+
+            host = msg.payload.get("assigned_host")
+            port = msg.payload.get("assigned_tcp_port")
+            if host and port:
+                return host, int(port)
+            return None, None
+        except socket.timeout:
+            return None, None
+        except Exception:
+            return None, None
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    def _resend_pending(self):
+        """Resend all un-ACKed messages in seq order (same message_id + seq)."""
+        with self.pending_lock:
+            items = list(self.pending.items())
+
+        # sort by seq to preserve sender FIFO
+        items.sort(key=lambda kv: kv[1].get("seq", 0))
+
+        for message_id, meta in items:
+            content = meta.get("content", "")
+            recipient = meta.get("recipient")
+            seq = meta.get("seq")
+
+            # Recreate message with SAME message_id and SAME seq
+            msg = ClientMessage(
+                self.client_id,
+                content,
+                recipient=recipient,
+                seq=seq,
+                message_id=message_id
+            )
+            try:
+                self._send_raw(msg)
+            except Exception as e:
+                # If resend fails, reconnect loop will run again from sender/receiver paths
+                self.logger.warning(f"Resend failed for {message_id}: {e}")
+                raise
+
+    # ----------------------------
+    # Entry point
+    # ----------------------------
 def main():
     import sys
 
@@ -257,7 +462,7 @@ def main():
 
     print(f"Connecting to {host}:{port}...")
     c = Client(client_id, host, port)
-    c.connect()
+    c.connect(start_receiver=True)
     c.run_cli()
 
 

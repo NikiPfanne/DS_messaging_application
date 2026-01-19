@@ -417,7 +417,11 @@ class Server:
                 msg = Message.from_json(data.decode('utf-8'))
 
                 if msg.msg_type == MessageType.SERVER_DISCOVERY:
-                    self._handle_server_discovery(msg, address)
+                    with self.leader_lock:
+                        is_leader = self.is_leader
+                    if is_leader:
+                        self._handle_server_discovery(msg, address)
+                    # follower ignorieren discovery (leader hört multicast sowieso)
                     continue
 
                 if msg.sender_id == self.server_id:
@@ -440,7 +444,6 @@ class Server:
 
     def _handle_server_discovery(self, msg: Message, address):
         """Reply to discovery request with SERVER_ANNOUNCE via multicast."""
-        requester_ip = address[0]
 
         with self.leader_lock:
             is_leader = self.is_leader
@@ -448,17 +451,15 @@ class Server:
                 self.server_id if self.is_leader else None
             )
 
+        best = self._pick_best_server()
+
         announce_payload = {
-            'host': requester_ip,
-            'tcp_port': self.tcp_port,
-            'server_id': self.server_id,
-            'is_leader': is_leader,
-            'current_leader': current_leader,
-            'load': len(self.clients),
-            'capacity': self.max_clients,
+            'assigned_host': best['host'],
+            'assigned_tcp_port': best['tcp_port'],
+            'assigned_server_id': best['server_id'],
+            'leader_id': self.server_id,
             'ts': time.time(),
         }
-
         announce = Message(MessageType.SERVER_ANNOUNCE, self.server_id, announce_payload)
 
         try:
@@ -469,6 +470,38 @@ class Server:
             self.logger.info(f"Replied to SERVER_DISCOVERY from {address[0]} with SERVER_ANNOUNCE")
         except (PermissionError, OSError) as e:
             self.logger.warning(f"Failed to send SERVER_ANNOUNCE (multicast unavailable?): {e}")
+
+        self.logger.info(
+            f"Discovery: assigned {best['server_id']} @ {best['host']}:{best['tcp_port']} to client {address[0]}"
+        )
+
+    def _pick_best_server(self) -> dict:
+        """Return best server endpoint: {'server_id','host','tcp_port','load'}"""
+        candidates = []
+
+        # self als Kandidat
+        candidates.append({
+            'server_id': self.server_id,
+            'host': '127.0.0.1',          # für Demo lokal; besser: socket.gethostbyname(socket.gethostname())
+            'tcp_port': self.tcp_port,
+            'load': len(self.clients),
+        })
+
+        now = time.time()
+        with self.servers_lock:
+            for sid, info in self.known_servers.items():
+                if now - info.get('last_heartbeat', 0) <= self.FAILURE_TIMEOUT:
+                    candidates.append({
+                        'server_id': sid,
+                        'host': info.get('host'),
+                        'tcp_port': info.get('port'),
+                        'load': info.get('load', 0),
+                    })
+
+        # kleinste load gewinnt
+        candidates.sort(key=lambda x: x['load'])
+        return candidates[0]
+
 
     def _handle_heartbeat(self, msg: Message, address):
         """Handle heartbeat from another server"""
