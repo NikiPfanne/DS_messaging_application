@@ -1,14 +1,29 @@
+"""
+Distributed messaging server implementation.
+Features:
+- TCP connections for clients
+- UDP multicast for server coordination + discovery
+- LeLann-Chang-Roberts leader election
+- Heartbeat-based fault detection
+- Load balancing
+- Dynamic discovery (SERVER_DISCOVERY / SERVER_ANNOUNCE)
+- Client message ACKs (MESSAGE_ACK)
+- FIFO ordering for inter-server forwarded messages (best-effort via seq per original_sender)
+"""
+
 import socket
 import threading
 import time
 import struct
 import logging
+import uuid
+from collections import defaultdict
 from typing import Dict, Set, Optional, List
+
 from protocol import (
     Message, MessageType, HeartbeatMessage, LeaderElectionMessage,
     LeaderAnnouncementMessage, ServerResponse, ClientMessage
 )
-import uuid
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,14 +54,13 @@ class Server:
         self.current_leader = None
         self.election_in_progress = False
         self.election_initiator = None
-        self.leader_lock = threading.Lock()  # Protect leader state
+        self.leader_lock = threading.Lock()
 
         # Client management
         self.clients: Dict[str, socket.socket] = {}
         self.client_lock = threading.Lock()
 
         # Server discovery and fault detection
-        # server_id -> {last_heartbeat, port, is_leader, load, host?}
         self.known_servers: Dict[str, dict] = {}
         self.servers_lock = threading.Lock()
 
@@ -63,19 +77,19 @@ class Server:
         self.forwarded_ids: Set[str] = set()
         self.last_election_attempt = 0.0
 
+        # FIFO state for inter-server forwarded messages (per original_sender)
+        self.last_delivered_seq = defaultdict(int)    # sender -> last seq delivered
+        self.fifo_buffer = defaultdict(dict)          # sender -> {seq: payload}
+        self.fifo_lock = threading.Lock()
+
         self.logger = logging.getLogger(f"Server-{server_id}")
 
     def start(self):
         """Start the server"""
         self.is_running = True
 
-        # Setup TCP socket for client connections
         self._setup_tcp_socket()
-
-        # Setup UDP multicast socket for server coordination + discovery
         self._setup_udp_socket()
-
-        # Start background threads
         self._start_threads()
 
         self.logger.info(f"Server {self.server_id} started on TCP port {self.tcp_port}")
@@ -84,7 +98,6 @@ class Server:
         """Stop the server"""
         self.is_running = False
 
-        # Close all client connections
         with self.client_lock:
             for _, client_socket in list(self.clients.items()):
                 try:
@@ -93,7 +106,6 @@ class Server:
                     pass
             self.clients.clear()
 
-        # Close server sockets
         if self.tcp_socket:
             try:
                 self.tcp_socket.close()
@@ -105,7 +117,6 @@ class Server:
             except Exception:
                 pass
 
-        # Wait for threads to finish
         for thread in self.threads:
             try:
                 thread.join(timeout=2.0)
@@ -118,7 +129,6 @@ class Server:
         """Setup TCP socket for client connections"""
         self.tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.tcp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        # Bind to all interfaces to accept connections from any network interface
         self.tcp_socket.bind(('0.0.0.0', self.tcp_port))
         self.tcp_socket.listen(self.max_clients)
 
@@ -128,21 +138,17 @@ class Server:
             self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-            # Bind to multicast port on all interfaces
             self.udp_socket.bind(('', self.MULTICAST_PORT))
 
-            # Join multicast group
             mreq = struct.pack("4sl", socket.inet_aton(self.MULTICAST_GROUP), socket.INADDR_ANY)
             self.udp_socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
-            # Allow sending multicast messages
             self.udp_socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
 
             self.logger.info("UDP multicast enabled")
         except Exception as e:
             self.logger.warning(f"Could not setup UDP multicast: {e}")
             self.logger.warning("Running in single-server mode (coordination disabled)")
-            # Dummy socket so app doesn't crash
             self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.udp_socket.bind(('127.0.0.1', 0))
 
@@ -156,7 +162,6 @@ class Server:
             threading.Thread(target=self._ensure_leader_when_alone, daemon=True),
             threading.Thread(target=self._leader_monitor, daemon=True),
         ]
-
         for thread in threads:
             thread.start()
             self.threads.append(thread)
@@ -184,7 +189,6 @@ class Server:
         """Handle individual client connection"""
         client_id = None
         try:
-            # Keep connections alive; do not drop idle clients aggressively
             try:
                 client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             except (OSError, AttributeError):
@@ -192,28 +196,24 @@ class Server:
             client_socket.settimeout(None)
 
             while self.is_running:
-                # Receive message length prefix
                 length_data = self._recv_exactly(client_socket, 4)
                 if not length_data:
                     break
 
                 length = int.from_bytes(length_data, byteorder='big')
-                if length > 1024 * 1024:  # 1MB limit
+                if length > 1024 * 1024:
                     self.logger.warning(f"Message too large from {address}")
                     break
 
-                # Receive message data
                 msg_data = self._recv_exactly(client_socket, length)
                 if not msg_data:
                     break
 
-                # Parse message
                 msg = Message.from_json(msg_data.decode('utf-8'))
 
-                # Handle different message types
                 if msg.msg_type == MessageType.CLIENT_REGISTER:
                     client_id = msg.sender_id
-                    # Reject duplicate client IDs on the same server to avoid ambiguous delivery
+
                     with self.client_lock:
                         if client_id in self.clients:
                             response = ServerResponse(
@@ -223,6 +223,7 @@ class Server:
                             )
                             self._send_message(client_socket, response)
                             break
+
                     with self.client_lock:
                         self.clients[client_id] = client_socket
 
@@ -272,13 +273,14 @@ class Server:
             self.logger.error(f"Error sending message: {e}")
 
     def _handle_client_message(self, msg: Message, client_socket: socket.socket):
-        """Handle client message - store and forward (unicast or broadcast)"""
+        """Handle client message - ACK + deliver (unicast or broadcast)"""
         content = msg.payload.get('content', '')
         recipient = msg.payload.get('recipient')
+        seq = msg.payload.get('seq')  # may be None
 
         self.logger.info(f"Message from {msg.sender_id}: {content}")
 
-        # After processing: send explicit ACK for chat message
+        # Explicit ACK for chat messages
         ack = Message(
             MessageType.MESSAGE_ACK,
             self.server_id,
@@ -289,28 +291,25 @@ class Server:
         )
         self._send_message(client_socket, ack)
 
-        # If recipient specified, deliver directly, otherwise broadcast to all
         if recipient:
-            self._deliver_message(msg.sender_id, recipient, content, msg_id=msg.message_id)
+            self._deliver_message(msg.sender_id, recipient, content, msg_id=msg.message_id, seq=seq)
         else:
-            self._broadcast_message(msg.sender_id, content, forward=True, msg_id=msg.message_id, skip_sender=True)
+            self._broadcast_message(msg.sender_id, content, forward=True, msg_id=msg.message_id, seq=seq, skip_sender=True)
 
-    def _deliver_message(self, sender: str, recipient: str, content: str, msg_id: str = None):
-        """Deliver message to recipient (local or via another server)"""
+    def _deliver_message(self, sender: str, recipient: str, content: str, msg_id: str = None, seq: Optional[int] = None):
+        """Deliver message to recipient (local or forward via multicast)"""
         if msg_id is None:
             msg_id = str(uuid.uuid4())
-
 
         forwarded = False
         with self.client_lock:
             if recipient in self.clients:
-                # If recipient is same as sender on this server, avoid self-echo but allow forwarding
                 if recipient == sender:
-                    forwarded = True  # still forward to other servers
+                    forwarded = True
                 else:
                     try:
-                        msg = ClientMessage(sender, content)
-                        self._send_message(self.clients[recipient], msg)
+                        out = ClientMessage(sender, content, recipient=None, seq=seq, message_id=msg_id)
+                        self._send_message(self.clients[recipient], out)
                         self.logger.info(f"Delivered message from {sender} to {recipient}")
                         return
                     except (socket.error, OSError) as e:
@@ -328,7 +327,8 @@ class Server:
                     'recipient': recipient,
                     'content': content,
                     'msg_id': msg_id,
-                    'broadcast': False
+                    'broadcast': False,
+                    'seq': seq
                 }
             )
             try:
@@ -340,24 +340,19 @@ class Server:
             except (PermissionError, OSError) as e:
                 self.logger.error(f"Failed to forward to {recipient}: {e}")
 
-    def _broadcast_message(self, sender: str, content: str, forward: bool = False, msg_id: str = None, skip_sender: bool = True):
-        """Broadcast message to all connected clients; optionally forward to other servers.
-
-        skip_sender controls whether a local client with the same ID as the sender
-        is excluded (True on origin; False on forwarded broadcasts so duplicates on
-        other servers still receive).
-        """
+    def _broadcast_message(self, sender: str, content: str, forward: bool = False,
+                           msg_id: str = None, seq: Optional[int] = None, skip_sender: bool = True):
+        """Broadcast to all local clients; optionally forward to other servers."""
         if msg_id is None:
             msg_id = str(uuid.uuid4())
-
 
         with self.client_lock:
             targets = [cid for cid in self.clients.keys() if not (skip_sender and cid == sender)]
 
         for recipient in targets:
             try:
-                msg = ClientMessage(sender, content)
-                self._send_message(self.clients[recipient], msg)
+                out = ClientMessage(sender, content, recipient=None, seq=seq, message_id=msg_id)
+                self._send_message(self.clients[recipient], out)
                 self.logger.info(f"Broadcast from {sender} to {recipient}")
             except (socket.error, OSError) as e:
                 self.logger.error(f"Failed to broadcast to {recipient}: {e}")
@@ -371,7 +366,8 @@ class Server:
                     'recipient': None,
                     'content': content,
                     'broadcast': True,
-                    'msg_id': msg_id
+                    'msg_id': msg_id,
+                    'seq': seq
                 }
             )
             try:
@@ -404,7 +400,6 @@ class Server:
                         (self.MULTICAST_GROUP, self.MULTICAST_PORT)
                     )
                 except PermissionError:
-                    # Multicast not available in this environment
                     pass
 
                 time.sleep(self.HEARTBEAT_INTERVAL)
@@ -413,7 +408,7 @@ class Server:
                     self.logger.debug(f"Heartbeat sender error: {e}")
 
     def _heartbeat_receiver(self):
-        """Receive multicast messages from other servers + clients discovery"""
+        """Receive multicast messages from other servers + discovery requests"""
         self.udp_socket.settimeout(1.0)
         while self.is_running:
             try:
@@ -421,16 +416,13 @@ class Server:
                 self.last_coordination_seen = time.time()
                 msg = Message.from_json(data.decode('utf-8'))
 
-                # Dynamic discovery: respond to clients looking for servers
                 if msg.msg_type == MessageType.SERVER_DISCOVERY:
                     self._handle_server_discovery(msg, address)
                     continue
 
-                # Ignore own coordination messages
                 if msg.sender_id == self.server_id:
                     continue
 
-                # Handle different message types
                 if msg.msg_type == MessageType.HEARTBEAT:
                     self._handle_heartbeat(msg, address)
                 elif msg.msg_type == MessageType.LEADER_ELECTION:
@@ -440,9 +432,6 @@ class Server:
                 elif msg.msg_type == MessageType.FORWARD_MESSAGE:
                     self._handle_forward_message(msg)
 
-                # (Optional) If you later implement SERVER_ANNOUNCE handling on servers,
-                # you can add it here.
-
             except socket.timeout:
                 continue
             except Exception as e:
@@ -450,19 +439,17 @@ class Server:
                     self.logger.error(f"Error receiving multicast: {e}")
 
     def _handle_server_discovery(self, msg: Message, address):
-        """Reply to a discovery request with an announcement.
-
-        address: (ip, port) of sender. For multicast this will be the sender's interface IP.
-        We broadcast the announce to the multicast group so the client can hear it too.
-        """
+        """Reply to discovery request with SERVER_ANNOUNCE via multicast."""
         requester_ip = address[0]
 
         with self.leader_lock:
             is_leader = self.is_leader
-            current_leader = self.current_leader if self.current_leader is not None else (self.server_id if self.is_leader else None)
+            current_leader = self.current_leader if self.current_leader is not None else (
+                self.server_id if self.is_leader else None
+            )
 
         announce_payload = {
-            'host': requester_ip,               # best-effort: client can often connect back via this IP on same machine/net
+            'host': requester_ip,
             'tcp_port': self.tcp_port,
             'server_id': self.server_id,
             'is_leader': is_leader,
@@ -489,7 +476,6 @@ class Server:
 
         with self.servers_lock:
             is_new = server_id not in self.known_servers
-
             self.known_servers[server_id] = {
                 'last_heartbeat': time.time(),
                 'port': msg.payload.get('server_port'),
@@ -503,7 +489,6 @@ class Server:
                 f"Discovered new server via heartbeat: {server_id} @ {address[0]}:{msg.payload.get('server_port')}"
             )
 
-        # Update leader information if needed
         if msg.payload.get('is_leader'):
             with self.leader_lock:
                 self.current_leader = server_id
@@ -526,7 +511,6 @@ class Server:
             if failed_servers:
                 self.logger.warning(f"Detected failed servers: {failed_servers}")
 
-                # Check if leader failed
                 with self.leader_lock:
                     if self.current_leader in failed_servers:
                         leader_failed = True
@@ -537,50 +521,85 @@ class Server:
                     self.logger.warning("Leader failed, initiating election")
                     self._initiate_election()
 
-    def _handle_forward_message(self, msg: Message):
-        """Handle forwarded client message from another server"""
-        payload = msg.payload or {}
+    def _deliver_forward_payload_inorder(self, payload: dict):
+        """Deliver a forwarded payload to local clients (no forwarding here)."""
         orig_sender = payload.get('original_sender')
         recipient = payload.get('recipient')
         content = payload.get('content', '')
         msg_id = payload.get('msg_id')
         is_broadcast = payload.get('broadcast', False)
+        seq = payload.get('seq')
 
-        if not orig_sender or not recipient or not msg_id:
-            # For broadcast, recipient can be None
-            if not (is_broadcast and msg_id and orig_sender):
-                return
-
-        # Avoid processing the same forwarded message twice
-        if msg_id in self.forwarded_ids:
-            return
-        self.forwarded_ids.add(msg_id)
-
-        # Broadcast: deliver to all local clients except sender
         if is_broadcast:
-            # Allow delivery to same-named clients on other servers, so skip_sender=False here
-            self._broadcast_message(orig_sender, content, forward=False, msg_id=msg_id, skip_sender=False)
+            self._broadcast_message(orig_sender, content, forward=False, msg_id=msg_id, seq=seq, skip_sender=False)
             return
 
-        # Unicast: deliver to recipient if local, else re-forward best-effort
+        if not recipient:
+            return
+
         with self.client_lock:
             if recipient in self.clients:
                 try:
-                    out = ClientMessage(orig_sender, content)
+                    out = ClientMessage(orig_sender, content, recipient=None, seq=seq, message_id=msg_id)
                     self._send_message(self.clients[recipient], out)
                     self.logger.info(f"Forward-delivered message from {orig_sender} to {recipient}")
                 except (socket.error, OSError) as e:
                     self.logger.error(f"Failed forward delivery to {recipient}: {e}")
-            else:
-                try:
-                    self.udp_socket.sendto(msg.to_json().encode('utf-8'), (self.MULTICAST_GROUP, self.MULTICAST_PORT))
-                except (PermissionError, OSError):
-                    pass
+
+    def _handle_forward_message(self, msg: Message):
+        """Handle forwarded client message from another server (FIFO per original_sender via seq)."""
+        payload = msg.payload or {}
+
+        orig_sender = payload.get('original_sender')
+        recipient = payload.get('recipient')
+        content = payload.get('content', '')
+        msg_id = payload.get('msg_id')
+        is_broadcast = payload.get('broadcast', False)
+        seq = payload.get('seq')
+
+        # validate minimal fields
+        if not orig_sender or not msg_id:
+            return
+        if (not is_broadcast) and (not recipient):
+            return
+
+        # dedup
+        if msg_id in self.forwarded_ids:
+            return
+        self.forwarded_ids.add(msg_id)
+
+        # No seq => best-effort (no ordering across servers)
+        if seq is None:
+            self._deliver_forward_payload_inorder(payload)
+            return
+
+        # FIFO per original sender (across servers)
+        with self.fifo_lock:
+            last = self.last_delivered_seq[orig_sender]
+
+            if seq <= last:
+                return  # old/duplicate
+
+            if seq > last + 1:
+                self.fifo_buffer[orig_sender][seq] = payload
+                return  # wait for gap
+
+            # seq == last+1 -> deliver and flush buffer
+            self._deliver_forward_payload_inorder(payload)
+            self.last_delivered_seq[orig_sender] = seq
+
+            next_seq = seq + 1
+            while next_seq in self.fifo_buffer[orig_sender]:
+                p = self.fifo_buffer[orig_sender].pop(next_seq)
+                self._deliver_forward_payload_inorder(p)
+                self.last_delivered_seq[orig_sender] = next_seq
+                next_seq += 1
 
     def _ensure_leader_when_alone(self):
         """If no other servers are known and no leader is set, self-assign as leader"""
         while self.is_running:
             time.sleep(self.HEARTBEAT_INTERVAL)
+
             with self.leader_lock:
                 no_leader = self.current_leader is None
                 already_leader = self.is_leader
@@ -588,8 +607,10 @@ class Server:
 
             now = time.time()
             with self.servers_lock:
-                active_servers = [sid for sid, info in self.known_servers.items()
-                                  if now - info.get('last_heartbeat', 0) <= self.FAILURE_TIMEOUT]
+                active_servers = [
+                    sid for sid, info in self.known_servers.items()
+                    if now - info.get('last_heartbeat', 0) <= self.FAILURE_TIMEOUT
+                ]
 
             idle_long_enough = (now - self.last_coordination_seen) > self.FAILURE_TIMEOUT
             started_long_enough = (time.monotonic() - self.start_time_monotonic) > self.FAILURE_TIMEOUT
@@ -630,8 +651,8 @@ class Server:
 
         election_msg = LeaderElectionMessage(
             self.server_id,
-            self.server_id,  # candidate_id
-            self.server_id   # initiator_id
+            self.server_id,
+            self.server_id
         )
 
         msg_data = election_msg.to_json().encode('utf-8')
@@ -657,33 +678,15 @@ class Server:
             return
 
         if candidate_id > self.server_id:
-            election_msg = LeaderElectionMessage(
-                self.server_id,
-                candidate_id,
-                initiator_id
-            )
-            msg_data = election_msg.to_json().encode('utf-8')
-            try:
-                self.udp_socket.sendto(
-                    msg_data,
-                    (self.MULTICAST_GROUP, self.MULTICAST_PORT)
-                )
-            except (PermissionError, OSError):
-                pass
-        elif self.server_id > candidate_id:
-            election_msg = LeaderElectionMessage(
-                self.server_id,
-                self.server_id,
-                initiator_id
-            )
-            msg_data = election_msg.to_json().encode('utf-8')
-            try:
-                self.udp_socket.sendto(
-                    msg_data,
-                    (self.MULTICAST_GROUP, self.MULTICAST_PORT)
-                )
-            except (PermissionError, OSError):
-                pass
+            election_msg = LeaderElectionMessage(self.server_id, candidate_id, initiator_id)
+        else:
+            election_msg = LeaderElectionMessage(self.server_id, self.server_id, initiator_id)
+
+        msg_data = election_msg.to_json().encode('utf-8')
+        try:
+            self.udp_socket.sendto(msg_data, (self.MULTICAST_GROUP, self.MULTICAST_PORT))
+        except (PermissionError, OSError):
+            pass
 
     def _become_leader(self):
         """Become the leader and announce"""
@@ -697,10 +700,7 @@ class Server:
         announcement = LeaderAnnouncementMessage(self.server_id, self.server_id)
         msg_data = announcement.to_json().encode('utf-8')
         try:
-            self.udp_socket.sendto(
-                msg_data,
-                (self.MULTICAST_GROUP, self.MULTICAST_PORT)
-            )
+            self.udp_socket.sendto(msg_data, (self.MULTICAST_GROUP, self.MULTICAST_PORT))
         except (PermissionError, OSError):
             pass
 
@@ -734,10 +734,7 @@ class Server:
         announcement = LeaderAnnouncementMessage(self.server_id, self.server_id)
         msg_data = announcement.to_json().encode('utf-8')
         try:
-            self.udp_socket.sendto(
-                msg_data,
-                (self.MULTICAST_GROUP, self.MULTICAST_PORT)
-            )
+            self.udp_socket.sendto(msg_data, (self.MULTICAST_GROUP, self.MULTICAST_PORT))
         except (PermissionError, OSError):
             pass
 
@@ -766,7 +763,6 @@ class Server:
 
 
 def main():
-    """Main entry point for server"""
     import sys
 
     if len(sys.argv) < 3:
