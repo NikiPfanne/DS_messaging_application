@@ -15,7 +15,8 @@ class TestIntegration(unittest.TestCase):
     
     def setUp(self):
         """Set up test server"""
-        self.server = Server("test_server", 5555)
+        # Using a non-standard port to avoid conflicts
+        self.server = Server("test_server", 5556)
         self.server_thread = threading.Thread(target=self.server.start, daemon=True)
         self.server_thread.start()
         time.sleep(0.5)  # Give server time to start
@@ -27,11 +28,14 @@ class TestIntegration(unittest.TestCase):
     
     def test_client_connection(self):
         """Test that a client can connect to the server"""
-        client = Client("test_client1", "localhost", 5555)
+        client = Client("test_client1", "localhost", 5556)
         
         # Connect to server
-        success = client.connect()
-        self.assertTrue(success, "Client should connect successfully")
+        self.assertTrue(client.connect(), "Client should connect successfully")
+        client.start()
+        
+        # Wait for the client's internal loop to mark as connected
+        time.sleep(0.1)
         self.assertTrue(client.is_connected, "Client should be marked as connected")
         
         # Verify server registered the client
@@ -54,9 +58,9 @@ class TestIntegration(unittest.TestCase):
         
         # Connect 3 clients
         for i in range(3):
-            client = Client(f"client{i}", "localhost", 5555)
-            success = client.connect()
-            self.assertTrue(success, f"Client {i} should connect")
+            client = Client(f"client{i}", "localhost", 5556)
+            self.assertTrue(client.connect(), f"Client {i} should connect")
+            client.start()
             clients.append(client)
         
         # Verify server has all clients
@@ -74,8 +78,10 @@ class TestIntegration(unittest.TestCase):
     
     def test_message_sending(self):
         """Test sending messages through the server"""
-        client1 = Client("alice", "localhost", 5555)
-        client1.connect()
+        client1 = Client("alice", "localhost", 5556)
+        self.assertTrue(client1.connect())
+        client1.start()
+        time.sleep(0.1)
         
         # Send a message
         success = client1.send_message("Hello, world!")
@@ -86,8 +92,8 @@ class TestIntegration(unittest.TestCase):
     
     def test_message_callback(self):
         """Test receiving messages via callback"""
-        client1 = Client("alice", "localhost", 5555)
-        client2 = Client("bob", "localhost", 5555)
+        client1 = Client("alice", "localhost", 5556)
+        client2 = Client("bob", "localhost", 5556)
         
         received_messages = []
         
@@ -96,19 +102,23 @@ class TestIntegration(unittest.TestCase):
         
         client2.set_message_callback(on_message)
         
-        client1.connect()
-        client2.connect()
+        self.assertTrue(client1.connect())
+        self.assertTrue(client2.connect())
+        client1.start()
+        client2.start()
         
         time.sleep(0.2)
         
-        # Send message from client1 to client2
-        client1.send_message("Hello Bob!", "bob")
+        # Send message from client1 to all (broadcast)
+        client1.send_message("Hello everyone!")
         
         time.sleep(0.5)
         
-        # Verify message was received
-        # Note: In current implementation, local delivery is attempted
-        # but may not work without full server infrastructure
+        # Verify message was received by client2
+        self.assertEqual(len(received_messages), 1, "Should have received one message")
+        sender, content = received_messages[0]
+        self.assertEqual(sender, "alice")
+        self.assertEqual(content, "Hello everyone!")
         
         client1.disconnect()
         client2.disconnect()
@@ -118,7 +128,7 @@ class TestIntegration(unittest.TestCase):
         status = self.server.get_status()
         
         self.assertEqual(status['server_id'], "test_server")
-        self.assertEqual(status['tcp_port'], 5555)
+        self.assertEqual(status['tcp_port'], 5556)
         self.assertIn('is_leader', status)
         self.assertIn('connected_clients', status)
         self.assertIn('known_servers', status)

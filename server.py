@@ -434,12 +434,59 @@ class Server:
                     self._handle_leader_announcement(msg)
                 elif msg.msg_type == MessageType.FORWARD_MESSAGE:
                     self._handle_forward_message(msg)
+                elif msg.msg_type == MessageType.SERVER_DISCOVERY:
+                    self._handle_client_discovery(address)
             
             except socket.timeout:
                 continue
             except Exception as e:
                 if self.is_running:
                     self.logger.error(f"Error receiving multicast: {e}")
+    
+    def _handle_client_discovery(self, client_address):
+        """Handle discovery request from a client."""
+        if not self.is_leader:
+            return  # Only the leader responds
+
+        self.logger.info(f"Received discovery request from {client_address}")
+
+        # Find the best server based on load
+        best_server_id = self.server_id
+        min_load = len(self.clients)
+        best_server_port = self.tcp_port
+        best_server_host = 'localhost'  # Simplified for local testing
+
+        with self.servers_lock:
+            # Consider self as a candidate
+            all_servers = {self.server_id: {'load': min_load, 'port': self.tcp_port}}.copy()
+            all_servers.update(self.known_servers)
+
+            for server_id, info in all_servers.items():
+                if info.get('load', float('inf')) < min_load:
+                    min_load = info['load']
+                    best_server_id = server_id
+                    best_server_port = info['port']
+
+        # Announce the best server back to the client
+        response_payload = {
+            'host': best_server_host,
+            'port': best_server_port,
+            'server_id': best_server_id
+        }
+        response_msg = Message(
+            MessageType.SERVER_ANNOUNCE,
+            self.server_id,
+            response_payload
+        )
+        
+        try:
+            self.udp_socket.sendto(
+                response_msg.to_json().encode('utf-8'),
+                client_address
+            )
+            self.logger.info(f"Responded to discovery request from {client_address} with server {best_server_id} at {best_server_host}:{best_server_port}")
+        except Exception as e:
+            self.logger.error(f"Failed to send discovery response: {e}")
     
     def _handle_heartbeat(self, msg: Message):
         """Handle heartbeat from another server"""

@@ -7,8 +7,9 @@ import socket
 import threading
 import time
 import logging
-from typing import Optional, Callable
+from typing import Optional, Callable, Tuple
 from protocol import Message, MessageType, ClientMessage, ServerResponse
+import config
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,12 +35,15 @@ class Client:
         self.logger = logging.getLogger(f"Client-{client_id}")
     
     def connect(self) -> bool:
-        """Connect to the server"""
+        """Connect to the server and register."""
         try:
+            # Ensure any old connection is closed before starting a new one
+            if self.socket:
+                self._close_connection()
+
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.logger.info(f"Connecting to {self.server_host}:{self.server_port}...")
             self.socket.connect((self.server_host, self.server_port))
-            self.is_connected = True
-            self.is_running = True
             
             # Send registration message
             reg_msg = Message(MessageType.CLIENT_REGISTER, self.client_id)
@@ -50,40 +54,49 @@ class Client:
             if response and response.msg_type == MessageType.SERVER_RESPONSE:
                 if response.payload.get('success'):
                     self.logger.info(f"Connected to server: {response.payload.get('message')}")
-                    
-                    # Start receive thread
-                    self.receive_thread = threading.Thread(target=self._receive_loop, daemon=True)
-                    self.receive_thread.start()
-                    
+                    self.is_connected = True
                     return True
             
-            self.disconnect()
+            # If registration fails, clean up
+            self._close_connection()
             return False
         
         except Exception as e:
-            self.logger.error(f"Connection failed: {e}")
-            self.is_connected = False
+            self.logger.error(f"Connection attempt failed: {e}")
+            self._close_connection()
             return False
+
+    def start(self):
+        """Start the client's background processing loop."""
+        if not self.receive_thread or not self.receive_thread.is_alive():
+            self.is_running = True
+            self.receive_thread = threading.Thread(target=self._receive_loop, daemon=True)
+            self.receive_thread.start()
+
     
-    def disconnect(self):
-        """Disconnect from the server"""
-        self.is_running = False
-        
-        if self.is_connected and self.socket:
-            try:
-                # Send unregister message
-                unreg_msg = Message(MessageType.CLIENT_UNREGISTER, self.client_id)
-                self._send_message(unreg_msg)
-            except (socket.error, OSError):
-                pass
-        
+    def _close_connection(self):
+        """Internal method to close the socket and reset connection state."""
         if self.socket:
             try:
                 self.socket.close()
             except (socket.error, OSError):
                 pass
-        
+        self.socket = None
         self.is_connected = False
+
+    def disconnect(self):
+        """Disconnect from the server and stop running."""
+        self.is_running = False
+        
+        if self.is_connected and self.socket:
+            try:
+                # Send unregister message if we can
+                unreg_msg = Message(MessageType.CLIENT_UNREGISTER, self.client_id)
+                self._send_message(unreg_msg)
+            except (socket.error, OSError):
+                pass
+        
+        self._close_connection()
         self.logger.info("Disconnected from server")
     
     def send_message(self, content: str, recipient: Optional[str] = None) -> bool:
@@ -103,6 +116,48 @@ class Client:
     def set_message_callback(self, callback: Callable[[str, str], None]):
         """Set callback for incoming messages (callback receives sender and content)"""
         self.message_callback = callback
+
+    @staticmethod
+    def discover_server(client_id: str) -> Optional[Tuple[str, int]]:
+        """Discover a server using UDP multicast."""
+        logger = logging.getLogger(f"Client-{client_id}-Discovery")
+        logger.info(f"Attempting to discover a server on {config.DEFAULT_MULTICAST_GROUP}:{config.DEFAULT_MULTICAST_PORT}...")
+
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
+                sock.settimeout(config.UDP_TIMEOUT * 3)  # Give more time for discovery
+
+                # Send discovery message
+                discover_msg = Message(MessageType.SERVER_DISCOVERY, client_id)
+                sock.sendto(
+                    discover_msg.to_json().encode('utf-8'),
+                    (config.DEFAULT_MULTICAST_GROUP, config.DEFAULT_MULTICAST_PORT)
+                )
+                logger.info("Discovery message sent. Waiting for response...")
+
+                # Wait for a response
+                while True:
+                    try:
+                        data, addr = sock.recvfrom(4096)
+                        response = Message.from_json(data.decode('utf-8'))
+
+                        if response.msg_type == MessageType.SERVER_ANNOUNCE:
+                            payload = response.payload
+                            host = payload.get('host')
+                            port = payload.get('port')
+                            if host and port:
+                                logger.info(f"Discovered server {payload.get('server_id')} at {host}:{port}")
+                                return host, port
+                    except socket.timeout:
+                        logger.warning("Server discovery timed out.")
+                        return None
+                    except Exception:
+                        # Ignore malformed messages and continue listening until timeout
+                        continue
+        except Exception as e:
+            logger.error(f"Error during server discovery: {e}")
+            return None
+
     
     def _send_message(self, msg: Message):
         """Send message through socket"""
@@ -150,17 +205,39 @@ class Client:
         return data
     
     def _receive_loop(self):
-        """Continuously receive messages from server"""
-        while self.is_running and self.is_connected:
+        """Continuously receive messages from server, with reconnect logic."""
+        while self.is_running:
+            if not self.is_connected:
+                # If we have a server address, try to connect
+                if self.server_host and self.server_port:
+                    self.connect()
+
+                # If connection failed or we had no address, discover a new one
+                if not self.is_connected and self.is_running:
+                    self.logger.info("Attempting to discover a server...")
+                    discovered = self.discover_server(self.client_id)
+                    if discovered and self.is_running:
+                        self.server_host, self.server_port = discovered
+                        self.connect()
+
+                # If we're still not connected, wait and retry
+                if not self.is_connected and self.is_running:
+                    self.logger.warning("Failed to establish a connection. Retrying in 5 seconds...")
+                    time.sleep(5)
+                
+                continue # Restart the loop to check connection status
+
+            # At this point, we assume we are connected. Try receiving.
             msg = self._receive_message()
             
             if not msg:
+                # Connection lost
                 if self.is_running:
-                    self.logger.warning("Connection lost")
-                    self.is_connected = False
-                break
-            
-            self._handle_message(msg)
+                    self.logger.warning("Connection lost.")
+                    self._close_connection()
+                # The loop will attempt to reconnect on the next iteration
+            else:
+                self._handle_message(msg)
     
     def _handle_message(self, msg: Message):
         """Handle incoming message"""
@@ -192,8 +269,9 @@ def main():
         sys.exit(1)
     
     client_id = sys.argv[1]
-    server_host = sys.argv[2] if len(sys.argv) > 2 else 'localhost'
-    server_port = int(sys.argv[3]) if len(sys.argv) > 3 else 5000
+    # Optional host/port for initial connection attempt
+    server_host = sys.argv[2] if len(sys.argv) > 2 else None
+    server_port = int(sys.argv[3]) if len(sys.argv) > 3 else None
     
     client = Client(client_id, server_host, server_port)
     
@@ -204,13 +282,22 @@ def main():
     
     client.set_message_callback(on_message)
     
-    # Connect to server
-    print(f"Connecting to {server_host}:{server_port}...")
-    if not client.connect():
-        print("Failed to connect to server")
-        sys.exit(1)
+    # Start the client. It will handle connection and reconnection automatically.
+    client.start()
     
-    print(f"Connected as {client_id}")
+    # Wait a moment for the initial connection attempt
+    print("Client starting... waiting for connection.")
+    time.sleep(1) # Give receive_loop a moment to start
+    connect_timeout = time.time() + 15 # Wait up to 15s for first connection
+    while not client.is_connected and time.time() < connect_timeout and client.is_running:
+        time.sleep(0.5)
+
+    if not client.is_connected:
+        print("\nCould not connect to a server. Please check the network and servers.")
+        client.disconnect()
+        sys.exit(1)
+
+    print(f"Connected as {client_id}. Type 'quit' to exit.")
     print("Commands:")
     print("  send <message...>              - Broadcast")
     print("  send all|* <message...>        - Broadcast")
@@ -220,71 +307,70 @@ def main():
     print()
     
     try:
-        while client.is_connected:
+        while True:
+            # We no longer check client.is_connected here. The input loop runs
+            # independently. Sending will fail if disconnected.
             try:
                 user_input = input(f"{client_id}> ")
-                
-                if not user_input.strip():
-                    continue
-                
-                parts = user_input.strip().split()
-                command = parts[0].lower()
-                
-                if command == 'quit':
-                    break
-                
-                elif command == 'send':
-                    # Supported forms (prefer explicitness to avoid ambiguity):
-                    # send <message...>                      -> broadcast
-                    # send all <message...>                  -> broadcast
-                    # send * <message...>                    -> broadcast
-                    # send to <recipient> <message...>       -> private
-                    # send @<recipient> <message...>         -> private
-                    if len(parts) < 2:
-                        print("Usage: send <message...> | send all <message...> | send to <recipient> <message...> | send @<recipient> <message...>")
-                        continue
-
-                    # Explicit broadcast keywords
-                    if parts[1].lower() in ('all', '*'):
-                        msg_text = " ".join(parts[2:]).strip()
-                        if not msg_text:
-                            print("Usage: send all <message...>")
-                            continue
-                        client.send_message(msg_text)
-                        continue
-
-                    # Explicit private: 'to <recipient> <msg>'
-                    if parts[1].lower() == 'to':
-                        if len(parts) < 3:
-                            print("Usage: send to <recipient> <message...>")
-                            continue
-                        recipient = parts[2]
-                        msg_text = " ".join(parts[3:]).strip()
-                        if not msg_text:
-                            print("Usage: send to <recipient> <message...>")
-                            continue
-                        client.send_message(msg_text, recipient)
-                        continue
-
-                    # Explicit private: '@recipient <msg>'
-                    if parts[1].startswith('@'):
-                        recipient = parts[1][1:]
-                        msg_text = " ".join(parts[2:]).strip()
-                        if not recipient or not msg_text:
-                            print("Usage: send @<recipient> <message...>")
-                            continue
-                        client.send_message(msg_text, recipient)
-                        continue
-
-                    # Default: treat as broadcast to allow messages with spaces
-                    msg_text = " ".join(parts[1:]).strip()
-                    client.send_message(msg_text)
-                
-                else:
-                    print(f"Unknown command: {command}")
-            
             except EOFError:
+                break # Exit on Ctrl+D
+
+            if not user_input.strip():
+                continue
+            
+            parts = user_input.strip().split()
+            command = parts[0].lower()
+            
+            if command == 'quit':
                 break
+            
+            elif command == 'send':
+                if len(parts) < 2:
+                    print("Usage: send <message...> | send all <message...> | send to <recipient> <message...> | send @<recipient> <message...>")
+                    continue
+
+                # Explicit broadcast keywords
+                if parts[1].lower() in ('all', '*'):
+                    msg_text = " ".join(parts[2:]).strip()
+                    if not msg_text:
+                        print("Usage: send all <message...>")
+                        continue
+                    if not client.send_message(msg_text):
+                        print("Message failed to send. Client is likely disconnected.")
+                    continue
+
+                # Explicit private: 'to <recipient> <msg>'
+                if parts[1].lower() == 'to':
+                    if len(parts) < 3:
+                        print("Usage: send to <recipient> <message...>")
+                        continue
+                    recipient = parts[2]
+                    msg_text = " ".join(parts[3:]).strip()
+                    if not msg_text:
+                        print("Usage: send to <recipient> <message...>")
+                        continue
+                    if not client.send_message(msg_text, recipient):
+                        print("Message failed to send. Client is likely disconnected.")
+                    continue
+
+                # Explicit private: '@recipient <msg>'
+                if parts[1].startswith('@'):
+                    recipient = parts[1][1:]
+                    msg_text = " ".join(parts[2:]).strip()
+                    if not recipient or not msg_text:
+                        print("Usage: send @<recipient> <message...>")
+                        continue
+                    if not client.send_message(msg_text, recipient):
+                        print("Message failed to send. Client is likely disconnected.")
+                    continue
+
+                # Default: treat as broadcast to allow messages with spaces
+                msg_text = " ".join(parts[1:]).strip()
+                if not client.send_message(msg_text):
+                    print("Message failed to send. Client is likely disconnected.")
+            
+            else:
+                print(f"Unknown command: {command}")
     
     except KeyboardInterrupt:
         print("\nInterrupted")
