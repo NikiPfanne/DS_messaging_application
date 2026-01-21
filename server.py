@@ -370,8 +370,19 @@ class Server:
                         best_port = info['port']
         
         # If we're the best or leader, use localhost for local clients
+        # If we're the best or leader
         if best_server_id == self.server_id:
-            best_host = 'localhost'
+            # Versuche, die echte LAN-IP zu ermitteln, statt einfach 'localhost' zu senden
+            try:
+                # Dieser Trick verbindet nirgendwo hin, ermittelt aber die eigene IP des Interfaces
+                temp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                temp_sock.connect(("8.8.8.8", 80))
+                my_ip = temp_sock.getsockname()[0]
+                temp_sock.close()
+                best_host = my_ip
+            except Exception:
+                best_host = 'localhost' # Fallback, falls keine Netzwerkkarte aktiv ist
+            
             best_port = self.tcp_port
         
         resp = Message(MessageType.SERVER_ANNOUNCE, self.server_id, {
