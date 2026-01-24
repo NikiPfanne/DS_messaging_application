@@ -291,6 +291,7 @@ class Server:
                     try:
                         client_msg = ClientMessage(sender, content, seq=seq)
                         self._send_tcp(sock, client_msg)
+                        self.logger.info(f"Delivered broadcast message from {sender} to {cid} seq={seq}")
                     except: pass
         
         # 2. Forward to other servers via multicast
@@ -303,6 +304,7 @@ class Server:
             'broadcast': True
         })
         self._send_udp_multicast(fwd_msg)
+        self.logger.info(f"Forwarded broadcast message from {sender} via multicast seq={seq}")
 
     def _handle_forward_message(self, msg: Message):
         """Handle forwarded message from another server"""
@@ -416,6 +418,9 @@ class Server:
 
     def _handle_client_discovery(self, addr):
         """Handle discovery request from client - respond with best server"""
+        # Small delay to ensure client is listening on multicast group
+        time.sleep(0.05)
+        
         # Determine which server to recommend
         best_server_id = self.server_id
         best_host = self.interface_ip if self.interface_ip != '0.0.0.0' else 'localhost'
@@ -450,12 +455,13 @@ class Server:
             best_port = self.tcp_port
         
         resp = Message(MessageType.SERVER_ANNOUNCE, self.server_id, {
-            'host': best_host, 
-            'port': best_port, 
+            'assigned_host': best_host, 
+            'assigned_tcp_port': best_port, 
             'server_id': best_server_id
         })
         try:
-            self.udp_socket.sendto(resp.to_json().encode('utf-8'), addr)
+            # Send response to MULTICAST GROUP so client can receive it on their multicast socket
+            self.udp_socket.sendto(resp.to_json().encode('utf-8'), (self.MULTICAST_GROUP, self.MULTICAST_PORT))
             self.logger.info(f"Responded to client discovery with server {best_server_id}")
         except: pass
 

@@ -16,6 +16,7 @@ import threading
 import logging
 import time
 import uuid
+import struct
 from typing import Optional, Dict, Tuple
 
 from protocol import Message, MessageType, ClientMessage
@@ -352,32 +353,37 @@ class Client:
         """
         Send SERVER_DISCOVERY over UDP multicast and wait for SERVER_ANNOUNCE.
         Expects leader to answer with:
-          assigned_host, assigned_tcp_port, assigned_server_id, leader_id
+          assigned_host, assigned_tcp_port, assigned_server_id
         """
         # Create UDP socket for multicast send/recv
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # Windows-specific: allow multiple sockets on same port
+            if hasattr(socket, 'SO_REUSEPORT'):
+                try:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                except:
+                    pass
         except Exception:
             pass
 
-        # Try to bind to multicast port so we can receive SERVER_ANNOUNCE sent to the group.
-        # On some Windows setups this can fail if something is strict; fallback to ephemeral port (may miss announce).
-        bound = False
+        # CRITICAL: Bind to multicast port and interface BEFORE sending
         try:
-            s.bind(("", self.MULTICAST_PORT))
-            bound = True
-        except OSError:
-            s.bind(("", 0))
-            bound = False
-
-        # Join multicast group (only useful if bound to multicast port)
-        if bound:
-            try:
-                mreq = socket.inet_aton(self.MULTICAST_GROUP) + socket.inet_aton("0.0.0.0")
-                s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-            except Exception:
-                pass
+            # Bind to all interfaces on multicast port
+            s.bind(('0.0.0.0', self.MULTICAST_PORT))
+            
+            # Join the multicast group
+            mreq = struct.pack('4s4s', 
+                               socket.inet_aton(self.MULTICAST_GROUP), 
+                               socket.inet_aton('0.0.0.0'))
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            
+            self.logger.info(f"Discovery socket bound to {self.MULTICAST_GROUP}:{self.MULTICAST_PORT}")
+        except OSError as e:
+            self.logger.warning(f"Failed to bind multicast socket: {e}")
+            s.close()
+            return None, None
 
         s.settimeout(self.DISCOVERY_TIMEOUT)
 
@@ -391,7 +397,10 @@ class Client:
 
         # Send discovery to multicast group
         try:
-            s.sendto(discovery.to_json().encode("utf-8"), (self.MULTICAST_GROUP, self.MULTICAST_PORT))
+            data_to_send = discovery.to_json().encode("utf-8")
+            self.logger.info(f"Discovery: Sending {len(data_to_send)} bytes to {self.MULTICAST_GROUP}:{self.MULTICAST_PORT}")
+            bytes_sent = s.sendto(data_to_send, (self.MULTICAST_GROUP, self.MULTICAST_PORT))
+            self.logger.info(f"Discovery: Sent {bytes_sent} bytes successfully")
         except Exception as e:
             self.logger.warning(f"Discovery send failed: {e}")
             try:
@@ -400,21 +409,47 @@ class Client:
                 pass
             return None, None
 
-        # Wait for announce
+        # Wait for announce (filter out own messages)
         try:
-            data, addr = s.recvfrom(4096)
-            msg = Message.from_json(data.decode("utf-8"))
-            if msg.msg_type != MessageType.SERVER_ANNOUNCE:
-                return None, None
+            self.logger.info(f"Discovery: Waiting for response (timeout={self.DISCOVERY_TIMEOUT}s)...")
+            while True:
+                data, addr = s.recvfrom(4096)
+                msg = Message.from_json(data.decode("utf-8"))
+                
+                # Filter out our own discovery message (echo)
+                if msg.msg_type == MessageType.SERVER_DISCOVERY:
+                    if msg.sender_id == self.client_id:
+                        self.logger.debug(f"Discovery: Ignoring echo from ourselves")
+                        continue
+                    else:
+                        self.logger.debug(f"Discovery: Ignoring discovery from other client: {msg.sender_id}")
+                        continue
+                
+                # We're looking for SERVER_ANNOUNCE
+                if msg.msg_type != MessageType.SERVER_ANNOUNCE:
+                    self.logger.debug(f"Discovery: Ignoring unexpected message type: {msg.msg_type}")
+                    continue
+                
+                self.logger.info(f"Discovery: Received {len(data)} bytes from {addr}")
 
-            host = msg.payload.get("assigned_host")
-            port = msg.payload.get("assigned_tcp_port")
-            if host and port:
-                return host, int(port)
-            return None, None
+                host = msg.payload.get("assigned_host")
+                port = msg.payload.get("assigned_tcp_port")
+                server_id = msg.payload.get("server_id")
+                
+                if host and port:
+                    self.logger.info(f"Discovery: SUCCESS - Server {server_id} at {host}:{port}")
+                    return host, int(port)
+                else:
+                    self.logger.warning(f"Discovery: Invalid response - missing host or port in {msg.payload}")
+                    continue
+                    
         except socket.timeout:
+            self.logger.warning(f"Discovery: TIMEOUT after {self.DISCOVERY_TIMEOUT}s - no server response")
             return None, None
-        except Exception:
+        except Exception as e:
+            self.logger.warning(f"Discovery: Receive error: {e}")
+            import traceback
+            self.logger.debug(traceback.format_exc())
             return None, None
         finally:
             try:
