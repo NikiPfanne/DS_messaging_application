@@ -76,6 +76,10 @@ class Server:
         self.forwarded_ids: Set[str] = set()
         self.last_election_attempt = 0.0
         
+        # Client sequencing: client_id -> last_seq
+        self.client_seq: Dict[str, int] = {}
+        self.seq_lock = threading.RLock()
+        
         self.logger = logging.getLogger(f"Server-{server_id}")
     
     def start(self):
@@ -232,18 +236,24 @@ class Server:
         """Handle message from client - either private or broadcast"""
         content = msg.payload.get('content', '')
         recipient = msg.payload.get('recipient')
+        seq = msg.payload.get('seq')  # Extract sequence number
+        
+        # Track seq per client for FIFO ordering
+        if seq is not None:
+            with self.seq_lock:
+                self.client_seq[msg.sender_id] = seq
         
         # Send ACK to client
         self._send_tcp(client_socket, ServerResponse(self.server_id, True, "Received", {'message_id': msg.message_id}))
         
         if recipient:
             # Private message to specific recipient
-            self._deliver_private_message(msg.sender_id, recipient, content, msg.message_id)
+            self._deliver_private_message(msg.sender_id, recipient, content, msg.message_id, seq)
         else:
             # Broadcast to all clients
-            self._broadcast_message(msg.sender_id, content, msg.message_id)
+            self._broadcast_message(msg.sender_id, content, msg.message_id, seq)
 
-    def _deliver_private_message(self, sender: str, recipient: str, content: str, msg_id: str):
+    def _deliver_private_message(self, sender: str, recipient: str, content: str, msg_id: str, seq: Optional[int] = None):
         """Deliver private message - local first, then forward via multicast"""
         delivered_locally = False
         
@@ -251,8 +261,9 @@ class Server:
         with self.client_lock:
             if recipient in self.clients:
                 try:
-                    self._send_tcp(self.clients[recipient], ClientMessage(sender, content))
-                    self.logger.info(f"Delivered private message from {sender} to {recipient} (local)")
+                    client_msg = ClientMessage(sender, content, seq=seq)
+                    self._send_tcp(self.clients[recipient], client_msg)
+                    self.logger.info(f"Delivered private message from {sender} to {recipient} (local) seq={seq}")
                     delivered_locally = True
                 except Exception as e:
                     self.logger.debug(f"Local delivery failed: {e}")
@@ -264,20 +275,22 @@ class Server:
                 'original_sender': sender, 
                 'recipient': recipient, 
                 'content': content, 
-                'msg_id': msg_id, 
+                'msg_id': msg_id,
+                'seq': seq,
                 'broadcast': False
             })
             self._send_udp_multicast(fwd_msg)
-            self.logger.info(f"Forwarded private message for {recipient} via multicast")
+            self.logger.info(f"Forwarded private message for {recipient} via multicast seq={seq}")
 
-    def _broadcast_message(self, sender: str, content: str, msg_id: str):
+    def _broadcast_message(self, sender: str, content: str, msg_id: str, seq: Optional[int] = None):
         """Broadcast message to all clients on all servers"""
         # 1. Send to all local clients (except sender)
         with self.client_lock:
             for cid, sock in self.clients.items():
                 if cid != sender:
                     try:
-                        self._send_tcp(sock, ClientMessage(sender, content))
+                        client_msg = ClientMessage(sender, content, seq=seq)
+                        self._send_tcp(sock, client_msg)
                     except: pass
         
         # 2. Forward to other servers via multicast
@@ -285,7 +298,8 @@ class Server:
             'original_sender': sender, 
             'recipient': None, 
             'content': content, 
-            'msg_id': msg_id, 
+            'msg_id': msg_id,
+            'seq': seq,
             'broadcast': True
         })
         self._send_udp_multicast(fwd_msg)
@@ -308,6 +322,7 @@ class Server:
         content = payload['content']
         recipient = payload.get('recipient')
         is_broadcast = payload.get('broadcast', False)
+        seq = payload.get('seq')  # Extract seq from forwarded message
         
         with self.client_lock:
             if is_broadcast:
@@ -315,14 +330,16 @@ class Server:
                 for cid, sock in self.clients.items():
                     if cid != sender:
                         try:
-                            self._send_tcp(sock, ClientMessage(sender, content))
+                            client_msg = ClientMessage(sender, content, seq=seq)
+                            self._send_tcp(sock, client_msg)
                         except: pass
             else:
                 # Private message: only deliver if recipient is connected here
                 if recipient and recipient in self.clients:
                     try:
-                        self._send_tcp(self.clients[recipient], ClientMessage(sender, content))
-                        self.logger.info(f"Delivered forwarded private message to {recipient}")
+                        client_msg = ClientMessage(sender, content, seq=seq)
+                        self._send_tcp(self.clients[recipient], client_msg)
+                        self.logger.info(f"Delivered forwarded private message to {recipient} seq={seq}")
                     except: pass
 
     # ==================== UDP COMMUNICATION ====================

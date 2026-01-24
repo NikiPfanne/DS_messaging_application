@@ -251,7 +251,11 @@ class Client:
                 if msg.msg_type == MessageType.CLIENT_MESSAGE:
                     sender = msg.sender_id
                     content = msg.payload.get("content", "")
-                    print(f"\n[{sender}] {content}")
+                    seq = msg.payload.get("seq")
+                    if seq is not None:
+                        print(f"\n[{sender}] {content} [seq={seq}]")
+                    else:
+                        print(f"\n[{sender}] {content}")
                     print(f"{self.client_id}> ", end="", flush=True)
                     continue
 
