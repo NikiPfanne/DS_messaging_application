@@ -24,6 +24,7 @@ from protocol import (
     Message, MessageType, HeartbeatMessage, LeaderElectionMessage,
     LeaderAnnouncementMessage, ServerResponse, ClientMessage
 )
+import json
 
 logging.basicConfig(
     level=logging.INFO,
@@ -68,11 +69,32 @@ class Server:
         self.tcp_socket = None
         self.udp_socket = None
         self.threads: List[threading.Thread] = []
+        # Detected interface IP used for multicast/unicast replies
+        self.interface_ip = '0.0.0.0'
 
         self.last_coordination_seen = time.time()
         self.start_time = time.time()
         self.forwarded_ids: Set[str] = set()
         self.last_election_attempt = 0.0
+        
+        # Client sequencing: client_id -> last_seq
+        self.client_seq: Dict[str, int] = {}
+        self.seq_lock = threading.RLock()
+        # Buffers for out-of-order messages: client_id -> {seq: Message}
+        self.buffers: Dict[str, Dict[int, Message]] = {}
+        self.buffers_lock = threading.RLock()
+
+        # Cache of recently forwarded messages to support GAP requests
+        # Structure: client_id -> {seq: (Message, timestamp)}
+        self.resend_cache: Dict[str, Dict[int, tuple]] = {}
+        self.cache_lock = threading.RLock()
+
+        # Parameters
+        self.GAP_REQUEST_DELAY = 0.5  # seconds before sending GAP request
+        self.RESEND_CACHE_TTL = 60.0  # seconds to keep cached forwarded messages
+        self.RESEND_CACHE_MAX = 1000
+        self.BUFFER_MAX_PER_CLIENT = 500
+        self.BUFFER_TTL = 60.0
         
         self.logger = logging.getLogger(f"Server-{server_id}")
     
@@ -102,14 +124,57 @@ class Server:
         self.tcp_socket.listen(self.max_clients)
     
     def _setup_udp_socket(self):
+        # Automatische Suche nach der richtigen LAN/WLAN IP
+        target_ip = '0.0.0.0'
+        try:
+            # Wir holen alle IPs des Computers
+            hostname = socket.gethostname()
+            all_ips = socket.gethostbyname_ex(hostname)[2]
+            
+            # Wir filtern: Keine 127.0.0.1 und keine VirtualBox (meist 192.168.56.x)
+            # Wir nehmen die erste IP, die nach "echtem" Netzwerk aussieht
+            for ip in all_ips:
+                if not ip.startswith("127.") and not ip.startswith("169.254."):
+                    target_ip = ip
+                    break
+                    
+            self.logger.info(f"Auto-selected Interface IP: {target_ip}")
+            # Save chosen interface for later (discovery responses)
+            self.interface_ip = target_ip
+        except:
+            target_ip = '0.0.0.0'
+            self.interface_ip = target_ip
+
         try:
             self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.udp_socket.bind(('', self.MULTICAST_PORT))
-            mreq = struct.pack("4sl", socket.inet_aton(self.MULTICAST_GROUP), socket.INADDR_ANY)
-            self.udp_socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            
+            # Interface explizit setzen (Fix für Windows Hotspot)
+            if target_ip != '0.0.0.0':
+                self.udp_socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(target_ip))
+                # Mitgliedschaft auf diesem Interface anmelden
+                mreq = struct.pack("4s4s", socket.inet_aton(self.MULTICAST_GROUP), socket.inet_aton(target_ip))
+                self.udp_socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            else:
+                # Fallback für Standard-Verhalten
+                mreq = struct.pack("4sl", socket.inet_aton(self.MULTICAST_GROUP), socket.INADDR_ANY)
+                self.udp_socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+
+            # Ensure interface_ip is set even if target_ip was 0.0.0.0
+            if self.interface_ip == '0.0.0.0':
+                try:
+                    # try to infer a usable IP using the socket
+                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    s.connect(("8.8.8.8", 80))
+                    self.interface_ip = s.getsockname()[0]
+                    s.close()
+                except Exception:
+                    # keep as 0.0.0.0 if nothing works
+                    pass
+
             self.udp_socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-            self.logger.info("UDP multicast enabled")
+            self.logger.info(f"UDP multicast enabled on {target_ip}")
         except Exception as e:
             self.logger.error(f"UDP Setup failed: {e}")
 
@@ -120,6 +185,7 @@ class Server:
             threading.Thread(target=self._heartbeat_receiver, daemon=True),
             threading.Thread(target=self._failure_detector, daemon=True),
             threading.Thread(target=self._leader_monitor, daemon=True),
+            threading.Thread(target=self._cache_and_buffer_cleaner, daemon=True),
         ]
         for t in threads:
             t.start()
@@ -187,18 +253,68 @@ class Server:
         """Handle message from client - either private or broadcast"""
         content = msg.payload.get('content', '')
         recipient = msg.payload.get('recipient')
-        
-        # Send ACK to client
-        self._send_tcp(client_socket, ServerResponse(self.server_id, True, "Received", {'message_id': msg.message_id}))
-        
-        if recipient:
-            # Private message to specific recipient
-            self._deliver_private_message(msg.sender_id, recipient, content, msg.message_id)
-        else:
-            # Broadcast to all clients
-            self._broadcast_message(msg.sender_id, content, msg.message_id)
+        seq = msg.payload.get('seq')  # Extract sequence number
+        # New sequencing logic: ensure in-order processing across servers
+        sender = msg.sender_id
+        if seq is None:
+            # No seq: treat as normal immediate message
+            if recipient:
+                self._deliver_private_message(sender, recipient, content, msg.message_id, None)
+            else:
+                self._broadcast_message(sender, content, msg.message_id, None)
+            # ACK immediately
+            self._send_tcp(client_socket, ServerResponse(self.server_id, True, "Received", {'message_id': msg.message_id}))
+            return
 
-    def _deliver_private_message(self, sender: str, recipient: str, content: str, msg_id: str):
+        # Acquire seq state
+        with self.seq_lock:
+            last = self.client_seq.get(sender, 0)
+
+        if seq == last + 1:
+            # In-order: process, update seq, forward and ACK
+            # Update last seq
+            with self.seq_lock:
+                self.client_seq[sender] = seq
+
+            # Forward / deliver
+            if recipient:
+                self._deliver_private_message(sender, recipient, content, msg.message_id, seq)
+            else:
+                self._broadcast_message(sender, content, msg.message_id, seq)
+
+            # Cache forwarded message for potential resends
+            with self.cache_lock:
+                self.resend_cache.setdefault(sender, {})[seq] = (msg, time.time())
+                # Evict oldest if too big
+                if len(self.resend_cache[sender]) > self.RESEND_CACHE_MAX:
+                    # remove smallest seq keys
+                    keys = sorted(self.resend_cache[sender].keys())
+                    for k in keys[:len(keys) - self.RESEND_CACHE_MAX]:
+                        self.resend_cache[sender].pop(k, None)
+
+            # ACK to client
+            self._send_tcp(client_socket, ServerResponse(self.server_id, True, "Received", {'message_id': msg.message_id}))
+
+            # Try to process buffered messages for this sender
+            self._process_buffer_for_sender(sender)
+
+        elif seq <= last:
+            # Duplicate or old: ACK and ignore
+            self._send_tcp(client_socket, ServerResponse(self.server_id, True, "DuplicateIgnored", {'message_id': msg.message_id}))
+        else:
+            # Gap detected: buffer message and schedule gap request
+            with self.buffers_lock:
+                b = self.buffers.setdefault(sender, {})
+                if len(b) < self.BUFFER_MAX_PER_CLIENT:
+                    b[seq] = msg
+                else:
+                    # Buffer full: drop and log
+                    self.logger.warning(f"Buffer full for {sender}; dropping seq={seq}")
+
+            # Schedule GAP request after delay
+            threading.Thread(target=self._gap_request_after_delay, args=(sender, last + 1), daemon=True).start()
+
+    def _deliver_private_message(self, sender: str, recipient: str, content: str, msg_id: str, seq: Optional[int] = None):
         """Deliver private message - local first, then forward via multicast"""
         delivered_locally = False
         
@@ -206,11 +322,19 @@ class Server:
         with self.client_lock:
             if recipient in self.clients:
                 try:
-                    self._send_tcp(self.clients[recipient], ClientMessage(sender, content))
-                    self.logger.info(f"Delivered private message from {sender} to {recipient} (local)")
+                    client_msg = ClientMessage(sender, content, seq=seq)
+                    self._send_tcp(self.clients[recipient], client_msg)
+                    self.logger.info(f"Delivered private message from {sender} to {recipient} (local) seq={seq}")
                     delivered_locally = True
                 except Exception as e:
                     self.logger.debug(f"Local delivery failed: {e}")
+                    # Notify origin sender if connected here
+                    try:
+                        if sender in self.clients:
+                            note = ServerResponse(self.server_id, False, f"Delivery to {recipient} failed", {'original_msg_id': msg_id, 'recipient': recipient, 'seq': seq})
+                            self._send_tcp(self.clients[sender], note)
+                    except Exception:
+                        pass
         
         # 2. Always forward via multicast so other servers can deliver
         #    (recipient might be connected to another server)
@@ -219,31 +343,55 @@ class Server:
                 'original_sender': sender, 
                 'recipient': recipient, 
                 'content': content, 
-                'msg_id': msg_id, 
+                'msg_id': msg_id,
+                'seq': seq,
                 'broadcast': False
             })
+            # Cache before sending
+            if seq is not None:
+                with self.cache_lock:
+                    self.resend_cache.setdefault(sender, {})[seq] = (fwd_msg, time.time())
             self._send_udp_multicast(fwd_msg)
-            self.logger.info(f"Forwarded private message for {recipient} via multicast")
+            self.logger.info(f"Forwarded private message for {recipient} via multicast seq={seq}")
 
-    def _broadcast_message(self, sender: str, content: str, msg_id: str):
+    def _broadcast_message(self, sender: str, content: str, msg_id: str, seq: Optional[int] = None):
         """Broadcast message to all clients on all servers"""
         # 1. Send to all local clients (except sender)
         with self.client_lock:
             for cid, sock in self.clients.items():
                 if cid != sender:
                     try:
-                        self._send_tcp(sock, ClientMessage(sender, content))
-                    except: pass
+                        client_msg = ClientMessage(sender, content, seq=seq)
+                        self._send_tcp(sock, client_msg)
+                        self.logger.info(f"Delivered broadcast message from {sender} to {cid} seq={seq}")
+                    except Exception as e:
+                        self.logger.debug(f"Broadcast delivery failed to {cid}: {e}")
+                        # notify sender if connected here
+                        try:
+                            if sender in self.clients:
+                                note = ServerResponse(self.server_id, False, f"Delivery to {cid} failed", {'recipient': cid, 'seq': seq})
+                                self._send_tcp(self.clients[sender], note)
+                        except Exception:
+                            pass
         
         # 2. Forward to other servers via multicast
         fwd_msg = Message(MessageType.FORWARD_MESSAGE, self.server_id, {
             'original_sender': sender, 
             'recipient': None, 
             'content': content, 
-            'msg_id': msg_id, 
+            'msg_id': msg_id,
+            'seq': seq,
             'broadcast': True
         })
+        if seq is not None:
+            with self.cache_lock:
+                self.resend_cache.setdefault(sender, {})[seq] = (fwd_msg, time.time())
+                if len(self.resend_cache[sender]) > self.RESEND_CACHE_MAX:
+                    keys = sorted(self.resend_cache[sender].keys())
+                    for k in keys[:len(keys) - self.RESEND_CACHE_MAX]:
+                        self.resend_cache[sender].pop(k, None)
         self._send_udp_multicast(fwd_msg)
+        self.logger.info(f"Forwarded broadcast message from {sender} via multicast seq={seq}")
 
     def _handle_forward_message(self, msg: Message):
         """Handle forwarded message from another server"""
@@ -263,22 +411,74 @@ class Server:
         content = payload['content']
         recipient = payload.get('recipient')
         is_broadcast = payload.get('broadcast', False)
-        
-        with self.client_lock:
-            if is_broadcast:
-                # Broadcast: deliver to all local clients except sender
-                for cid, sock in self.clients.items():
-                    if cid != sender:
+        seq = payload.get('seq')  # Extract seq from forwarded message
+
+        # Sequencing: ensure we only deliver in-order; buffer out-of-order
+        with self.seq_lock:
+            last = self.client_seq.get(sender, 0)
+
+        if seq is None:
+            # No seq: deliver immediately
+            with self.client_lock:
+                if is_broadcast:
+                    for cid, sock in self.clients.items():
+                        if cid != sender:
+                            try:
+                                client_msg = ClientMessage(sender, content, seq=None)
+                                self._send_tcp(sock, client_msg)
+                            except: pass
+                else:
+                    if recipient and recipient in self.clients:
                         try:
-                            self._send_tcp(sock, ClientMessage(sender, content))
+                            client_msg = ClientMessage(sender, content, seq=None)
+                            self._send_tcp(self.clients[recipient], client_msg)
+                            self.logger.info(f"Delivered forwarded private message to {recipient} (no-seq)")
                         except: pass
-            else:
-                # Private message: only deliver if recipient is connected here
-                if recipient and recipient in self.clients:
-                    try:
-                        self._send_tcp(self.clients[recipient], ClientMessage(sender, content))
-                        self.logger.info(f"Delivered forwarded private message to {recipient}")
-                    except: pass
+            return
+
+        if seq == last + 1:
+            # In-order: deliver and update
+            with self.seq_lock:
+                self.client_seq[sender] = seq
+            with self.client_lock:
+                if is_broadcast:
+                    for cid, sock in self.clients.items():
+                        if cid != sender:
+                            try:
+                                client_msg = ClientMessage(sender, content, seq=seq)
+                                self._send_tcp(sock, client_msg)
+                            except: pass
+                else:
+                    if recipient and recipient in self.clients:
+                        try:
+                            client_msg = ClientMessage(sender, content, seq=seq)
+                            self._send_tcp(self.clients[recipient], client_msg)
+                            self.logger.info(f"Delivered forwarded private message to {recipient} seq={seq}")
+                        except: pass
+                        
+                            # Notify origin sender if connected here
+                        try:
+                                if sender in self.clients:
+                                    note = ServerResponse(self.server_id, False, f"Delivery to {recipient} failed", {'recipient': recipient, 'seq': seq})
+                                    self._send_tcp(self.clients[sender], note)
+                        except Exception:
+                                pass
+
+            # Process any buffered subsequent messages
+            self._process_buffer_for_sender(sender)
+
+        elif seq <= last:
+            # Duplicate: ignore
+            return
+        else:
+            # Future message: buffer it and schedule gap request
+            with self.buffers_lock:
+                b = self.buffers.setdefault(sender, {})
+                if len(b) < self.BUFFER_MAX_PER_CLIENT:
+                    b[seq] = msg
+                else:
+                    self.logger.warning(f"Buffer full for {sender}; dropping forwarded seq={seq}")
+            threading.Thread(target=self._gap_request_after_delay, args=(sender, last + 1), daemon=True).start()
 
     # ==================== UDP COMMUNICATION ====================
     
@@ -289,6 +489,15 @@ class Server:
             self.udp_socket.sendto(data, (self.MULTICAST_GROUP, self.MULTICAST_PORT))
         except Exception as e:
             self.logger.debug(f"UDP multicast error: {e}")
+
+    def _send_udp_unicast(self, host: str, port: int, msg: Message):
+        """Send message to specific host:port via UDP (no length prefix)."""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.sendto(msg.to_json().encode('utf-8'), (host, port))
+            s.close()
+        except Exception as e:
+            self.logger.debug(f"UDP unicast error to {host}:{port}: {e}")
 
     # ==================== HEARTBEAT & DISCOVERY ====================
 
@@ -328,6 +537,10 @@ class Server:
                     self._handle_leader_announcement(msg)
                 elif msg.msg_type == MessageType.FORWARD_MESSAGE:
                     self._handle_forward_message(msg)
+                elif msg.msg_type == MessageType.GAP_REQUEST:
+                    self._handle_gap_request(msg)
+                elif msg.msg_type == MessageType.GAP_RESPONSE:
+                    self._handle_gap_response(msg)
                 elif msg.msg_type == MessageType.SERVER_DISCOVERY:
                     self._handle_client_discovery(addr)
                     
@@ -352,11 +565,16 @@ class Server:
             with self.leader_lock: 
                 self.current_leader = msg.sender_id
 
+        # Optionally track last_seq per client if heartbeat carries it (not implemented here)
+
     def _handle_client_discovery(self, addr):
         """Handle discovery request from client - respond with best server"""
+        # Small delay to ensure client is listening on multicast group
+        time.sleep(0.05)
+        
         # Determine which server to recommend
         best_server_id = self.server_id
-        best_host = 'localhost'
+        best_host = self.interface_ip if self.interface_ip != '0.0.0.0' else 'localhost'
         best_port = self.tcp_port
         min_load = len(self.clients)
         
@@ -370,30 +588,163 @@ class Server:
                         best_port = info['port']
         
         # If we're the best or leader, use localhost for local clients
-        # If we're the best or leader
         if best_server_id == self.server_id:
-            # Versuche, die echte LAN-IP zu ermitteln, statt einfach 'localhost' zu senden
-            try:
-                # Dieser Trick verbindet nirgendwo hin, ermittelt aber die eigene IP des Interfaces
-                temp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                temp_sock.connect(("8.8.8.8", 80))
-                my_ip = temp_sock.getsockname()[0]
-                temp_sock.close()
-                best_host = my_ip
-            except Exception:
-                best_host = 'localhost' # Fallback, falls keine Netzwerkkarte aktiv ist
-            
+            # Prefer the interface IP we detected earlier
+            if self.interface_ip and not self.interface_ip.startswith('0'):
+                best_host = self.interface_ip
+            else:
+                # Fallback: try to infer the outgoing interface towards the client
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    s.connect((addr[0], addr[1]))
+                    best_host = s.getsockname()[0]
+                    s.close()
+                except Exception:
+                    # Last resort: use the client's source IP (likely reachable from client)
+                    best_host = addr[0]
+
             best_port = self.tcp_port
         
         resp = Message(MessageType.SERVER_ANNOUNCE, self.server_id, {
-            'host': best_host, 
-            'port': best_port, 
+            'assigned_host': best_host, 
+            'assigned_tcp_port': best_port, 
             'server_id': best_server_id
         })
         try:
-            self.udp_socket.sendto(resp.to_json().encode('utf-8'), addr)
+            # Send response to MULTICAST GROUP so client can receive it on their multicast socket
+            self.udp_socket.sendto(resp.to_json().encode('utf-8'), (self.MULTICAST_GROUP, self.MULTICAST_PORT))
             self.logger.info(f"Responded to client discovery with server {best_server_id}")
         except: pass
+
+    # ==================== GAP / RESEND HANDLING ====================
+
+    def _gap_request_after_delay(self, client_id: str, missing_seq: int):
+        time.sleep(self.GAP_REQUEST_DELAY)
+        # Check if still missing
+        with self.seq_lock:
+            last = self.client_seq.get(client_id, 0)
+        if missing_seq <= last:
+            return
+
+        # Build GAP_REQUEST
+        req = Message(MessageType.GAP_REQUEST, self.server_id, {
+            'client_id': client_id,
+            'missing_seq': missing_seq
+        })
+        # Multicast request; servers with cache will respond
+        self._send_udp_multicast(req)
+        self.logger.info(f"Sent GAP_REQUEST for {client_id} seq={missing_seq}")
+
+    def _handle_gap_request(self, msg: Message):
+        payload = msg.payload
+        client_id = payload.get('client_id')
+        missing_seq = payload.get('missing_seq')
+
+        # If we have cached message(s), send them back directly to requester (unicast if known)
+        with self.cache_lock:
+            client_cache = self.resend_cache.get(client_id, {})
+            entry = client_cache.get(missing_seq)
+
+        if not entry:
+            return
+
+        fwd_msg = entry[0]
+
+        # Try unicast to requester if we know host/port
+        requester = msg.sender_id
+        with self.servers_lock:
+            info = self.known_servers.get(requester)
+
+        if info:
+            try:
+                self._send_udp_unicast(info['host'], info['port'], fwd_msg)
+                self.logger.info(f"Responded to GAP_REQUEST from {requester} for {client_id} seq={missing_seq}")
+                return
+            except Exception:
+                pass
+
+        # Fallback: multicast the original forward message
+        self._send_udp_multicast(fwd_msg)
+        self.logger.info(f"Multicasted resend for {client_id} seq={missing_seq}")
+
+    def _handle_gap_response(self, msg: Message):
+        # We accept direct forwarded messages as normal FORWARD_MESSAGE, so GAP_RESPONSE is not used here.
+        pass
+
+    def _process_buffer_for_sender(self, sender: str):
+        """Iteratively flush buffered messages for a sender if next seq present."""
+        while True:
+            with self.seq_lock:
+                last = self.client_seq.get(sender, 0)
+            next_seq = last + 1
+            with self.buffers_lock:
+                b = self.buffers.get(sender, {})
+                msg = b.get(next_seq)
+                if not msg:
+                    return
+                # pop and process
+                b.pop(next_seq, None)
+
+            # Deliver the buffered message (it's a forwarded message object)
+            payload = msg.payload
+            content = payload.get('content')
+            recipient = payload.get('recipient')
+            is_broadcast = payload.get('broadcast', False)
+            seq = payload.get('seq')
+
+            # update last
+            with self.seq_lock:
+                self.client_seq[sender] = seq
+
+            with self.client_lock:
+                if is_broadcast:
+                    for cid, sock in self.clients.items():
+                        if cid != sender:
+                            try:
+                                client_msg = ClientMessage(sender, content, seq=seq)
+                                self._send_tcp(sock, client_msg)
+                            except: pass
+                else:
+                    if recipient and recipient in self.clients:
+                        try:
+                            client_msg = ClientMessage(sender, content, seq=seq)
+                            self._send_tcp(self.clients[recipient], client_msg)
+                        except: pass
+                        try:
+                                if sender in self.clients:
+                                    note = ServerResponse(self.server_id, False, f"Delivery to {recipient} failed", {'recipient': recipient, 'seq': seq})
+                                    self._send_tcp(self.clients[sender], note)
+                        except Exception:
+                                pass
+
+    def _cache_and_buffer_cleaner(self):
+        """Periodically evict old entries from resend_cache and buffers."""
+        while self.is_running:
+            now = time.time()
+            # Clean cache
+            with self.cache_lock:
+                for client_id in list(self.resend_cache.keys()):
+                    entries = self.resend_cache.get(client_id, {})
+                    for seq, (m, ts) in list(entries.items()):
+                        if now - ts > self.RESEND_CACHE_TTL:
+                            entries.pop(seq, None)
+                    if not entries:
+                        self.resend_cache.pop(client_id, None)
+
+            # Clean buffers by TTL
+            with self.buffers_lock:
+                for client_id in list(self.buffers.keys()):
+                    buf = self.buffers.get(client_id, {})
+                    # We didn't store timestamps for buffered msgs; keep by count only
+                    # If buffer too large, drop oldest seqs
+                    if len(buf) > self.BUFFER_MAX_PER_CLIENT:
+                        keys = sorted(buf.keys())
+                        for k in keys[:len(buf) - self.BUFFER_MAX_PER_CLIENT]:
+                            buf.pop(k, None)
+                    if not buf:
+                        self.buffers.pop(client_id, None)
+
+            time.sleep(1.0)
 
     # ==================== FAILURE DETECTION ====================
 

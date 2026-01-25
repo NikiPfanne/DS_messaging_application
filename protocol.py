@@ -7,7 +7,7 @@ import json
 import time
 from typing import Dict, Any, Optional
 from enum import Enum
-
+import uuid
 
 class MessageType(Enum):
     """Types of messages in the system"""
@@ -28,17 +28,19 @@ class MessageType(Enum):
     # Message delivery
     FORWARD_MESSAGE = "FORWARD_MESSAGE"
     MESSAGE_ACK = "MESSAGE_ACK"
+    GAP_REQUEST = "GAP_REQUEST"
+    GAP_RESPONSE = "GAP_RESPONSE"
 
 
 class Message:
     """Base message class for all communication"""
     
-    def __init__(self, msg_type: MessageType, sender_id: str, payload: Dict[str, Any] = None):
+    def __init__(self, msg_type: MessageType, sender_id: str, payload: Dict[str, Any] = None, message_id: str = None):
         self.msg_type = msg_type
         self.sender_id = sender_id
         self.payload = payload or {}
         self.timestamp = time.time()
-        self.message_id = f"{sender_id}_{self.timestamp}"
+        self.message_id = message_id or str(uuid.uuid4())
     
     def to_json(self) -> str:
         """Serialize message to JSON string"""
@@ -90,14 +92,13 @@ class Message:
 
 
 class ClientMessage(Message):
-    """Message from client to server"""
-    
-    def __init__(self, sender_id: str, content: str, recipient: Optional[str] = None):
-        payload = {
-            'content': content,
-            'recipient': recipient
-        }
-        super().__init__(MessageType.CLIENT_MESSAGE, sender_id, payload)
+    def __init__(self, sender_id: str, content: str, recipient: Optional[str] = None,
+                 seq: Optional[int] = None, message_id: Optional[str] = None):
+        payload = {'content': content, 'recipient': recipient}
+        if seq is not None:
+            payload['seq'] = seq
+        super().__init__(MessageType.CLIENT_MESSAGE, sender_id, payload, message_id=message_id)
+
 
 
 class ServerResponse(Message):
@@ -154,3 +155,25 @@ class LoadInfoMessage(Message):
             'capacity': capacity
         }
         super().__init__(MessageType.LOAD_INFO, sender_id, payload)
+
+
+class GapRequestMessage(Message):
+    """Request missing sequence(s) for a given client_id"""
+
+    def __init__(self, sender_id: str, client_id: str, missing_seq: int):
+        payload = {
+            'client_id': client_id,
+            'missing_seq': missing_seq
+        }
+        super().__init__(MessageType.GAP_REQUEST, sender_id, payload)
+
+
+class GapResponseMessage(Message):
+    """Response to a GapRequest: contains one or more forwarded messages as payload['messages'] (list of Message JSON)"""
+
+    def __init__(self, sender_id: str, client_id: str, messages: list):
+        payload = {
+            'client_id': client_id,
+            'messages': messages
+        }
+        super().__init__(MessageType.GAP_RESPONSE, sender_id, payload)
