@@ -28,6 +28,8 @@ class MessageType(Enum):
     # Message delivery
     FORWARD_MESSAGE = "FORWARD_MESSAGE"
     MESSAGE_ACK = "MESSAGE_ACK"
+    GAP_REQUEST = "GAP_REQUEST"
+    GAP_RESPONSE = "GAP_RESPONSE"
 
 
 class Message:
@@ -153,3 +155,25 @@ class LoadInfoMessage(Message):
             'capacity': capacity
         }
         super().__init__(MessageType.LOAD_INFO, sender_id, payload)
+
+
+class GapRequestMessage(Message):
+    """Request missing sequence(s) for a given client_id"""
+
+    def __init__(self, sender_id: str, client_id: str, missing_seq: int):
+        payload = {
+            'client_id': client_id,
+            'missing_seq': missing_seq
+        }
+        super().__init__(MessageType.GAP_REQUEST, sender_id, payload)
+
+
+class GapResponseMessage(Message):
+    """Response to a GapRequest: contains one or more forwarded messages as payload['messages'] (list of Message JSON)"""
+
+    def __init__(self, sender_id: str, client_id: str, messages: list):
+        payload = {
+            'client_id': client_id,
+            'messages': messages
+        }
+        super().__init__(MessageType.GAP_RESPONSE, sender_id, payload)
