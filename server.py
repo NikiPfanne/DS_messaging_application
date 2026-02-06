@@ -25,6 +25,7 @@ from protocol import (
     LeaderAnnouncementMessage, ServerResponse, ClientMessage
 )
 import json
+import uuid
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,6 +50,10 @@ class Server:
         self.server_id = server_id
         self.tcp_port = tcp_port
         self.max_clients = max_clients
+
+        # Globally unique identity for leader election (not lexicographic server_id)
+        self.server_uuid = str(uuid.uuid4())
+        self.server_uuid_int = uuid.UUID(self.server_uuid).int
         
         self.is_running = False
         self.is_leader = False
@@ -62,7 +67,7 @@ class Server:
         self.clients: Dict[str, socket.socket] = {}
         self.client_lock = threading.RLock()
         
-        # server_id -> {last_heartbeat, host, port, is_leader, load}
+        # server_id -> {last_heartbeat, host, port, is_leader, server_uuid}
         self.known_servers: Dict[str, dict] = {}  
         self.servers_lock = threading.RLock()
         
@@ -191,7 +196,18 @@ class Server:
             t.start()
             self.threads.append(t)
     
-    # ==================== CLIENT HANDLING ====================
+    
+    # ==================== UUID HELPERS ====================
+
+    @staticmethod
+    def _safe_uuid_int(u: Optional[str]) -> int:
+        """Parse UUID string to comparable int. Unknown UUIDs sort last."""
+        try:
+            return uuid.UUID(str(u)).int
+        except Exception:
+            return (1 << 128) - 1
+
+# ==================== CLIENT HANDLING ====================
     
     def _accept_clients(self):
         self.tcp_socket.settimeout(1.0)
@@ -507,10 +523,7 @@ class Server:
             try:
                 with self.leader_lock: 
                     is_leader = self.is_leader
-                with self.client_lock:
-                    load = len(self.clients)
-                
-                hb = HeartbeatMessage(self.server_id, self.tcp_port, is_leader, load)
+                hb = HeartbeatMessage(self.server_id, self.tcp_port, is_leader, self.server_uuid)
                 self._send_udp_multicast(hb)
                 time.sleep(self.HEARTBEAT_INTERVAL)
             except: pass
@@ -556,8 +569,9 @@ class Server:
                 'last_heartbeat': time.time(),
                 'host': ip,
                 'port': msg.payload['server_port'],
-                'is_leader': msg.payload['is_leader'],
-                'load': msg.payload['load']
+                'is_leader': msg.payload.get('is_leader', False),
+                'server_uuid': msg.payload.get('server_uuid'),
+                'uuid_int': self._safe_uuid_int(msg.payload.get('server_uuid'))
             }
         
         # Update leader info if sender claims to be leader
@@ -568,55 +582,46 @@ class Server:
         # Optionally track last_seq per client if heartbeat carries it (not implemented here)
 
     def _handle_client_discovery(self, addr):
-        """Handle discovery request from client - respond with best server"""
+        """Handle discovery request from client.
+
+        Node/load balancing intentionally removed: we return the current leader if known,
+        otherwise this server. The client then connects via TCP using the returned host/port.
+        """
         # Small delay to ensure client is listening on multicast group
         time.sleep(0.05)
-        
-        # Determine which server to recommend
-        best_server_id = self.server_id
-        best_host = self.interface_ip if self.interface_ip != '0.0.0.0' else 'localhost'
-        best_port = self.tcp_port
-        min_load = len(self.clients)
-        
-        with self.servers_lock:
-            for sid, info in self.known_servers.items():
-                if time.time() - info['last_heartbeat'] <= self.FAILURE_TIMEOUT:
-                    if info['load'] < min_load:
-                        min_load = info['load']
-                        best_server_id = sid
-                        best_host = info['host']
-                        best_port = info['port']
-        
-        # If we're the best or leader, use localhost for local clients
-        if best_server_id == self.server_id:
-            # Prefer the interface IP we detected earlier
-            if self.interface_ip and not self.interface_ip.startswith('0'):
-                best_host = self.interface_ip
-            else:
-                # Fallback: try to infer the outgoing interface towards the client
-                try:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    s.connect((addr[0], addr[1]))
-                    best_host = s.getsockname()[0]
-                    s.close()
-                except Exception:
-                    # Last resort: use the client's source IP (likely reachable from client)
-                    best_host = addr[0]
 
-            best_port = self.tcp_port
-        
+        # Default: ourselves
+        chosen_server_id = self.server_id
+        chosen_host = self.interface_ip if self.interface_ip != '0.0.0.0' else addr[0]
+        chosen_port = self.tcp_port
+
+        # Prefer known leader if alive
+        with self.leader_lock:
+            leader_id = self.current_leader
+
+        if leader_id:
+            with self.servers_lock:
+                info = self.known_servers.get(leader_id)
+            if info and (time.time() - info.get('last_heartbeat', 0) <= self.FAILURE_TIMEOUT):
+                chosen_server_id = leader_id
+                chosen_host = info.get('host', chosen_host)
+                chosen_port = info.get('port', chosen_port)
+
         resp = Message(MessageType.SERVER_ANNOUNCE, self.server_id, {
-            'assigned_host': best_host, 
-            'assigned_tcp_port': best_port, 
-            'server_id': best_server_id
+            'assigned_host': chosen_host,
+            'assigned_tcp_port': chosen_port,
+            'server_id': chosen_server_id
         })
+
         try:
             # Send response to MULTICAST GROUP so client can receive it on their multicast socket
             self.udp_socket.sendto(resp.to_json().encode('utf-8'), (self.MULTICAST_GROUP, self.MULTICAST_PORT))
-            self.logger.info(f"Responded to client discovery with server {best_server_id}")
-        except: pass
+            self.logger.info(f"Responded to client discovery with server {chosen_server_id} at {chosen_host}:{chosen_port}")
+        except Exception:
+            pass
 
     # ==================== GAP / RESEND HANDLING ====================
+
 
     def _gap_request_after_delay(self, client_id: str, missing_seq: int):
         time.sleep(self.GAP_REQUEST_DELAY)
@@ -781,11 +786,21 @@ class Server:
     # ==================== LEADER ELECTION (LeLann-Chang-Roberts) ====================
     
     def _get_ring(self) -> List[str]:
-        """Get sorted list of all active servers (including self) = the ring"""
+        """Get ring of all active servers (including self), ordered by server_uuid (UUID int)."""
         with self.servers_lock:
-            active = [sid for sid, info in self.known_servers.items() 
-                      if time.time() - info['last_heartbeat'] <= self.FAILURE_TIMEOUT]
-        return sorted(active + [self.server_id])
+            active = [sid for sid, info in self.known_servers.items()
+                      if time.time() - info.get('last_heartbeat', 0) <= self.FAILURE_TIMEOUT]
+
+        ring = active + [self.server_id]
+
+        def key(sid: str) -> int:
+            if sid == self.server_id:
+                return self.server_uuid_int
+            with self.servers_lock:
+                info = self.known_servers.get(sid, {})
+            return int(info.get('uuid_int', (1 << 128) - 1))
+
+        return sorted(ring, key=key)
     
     def _get_next_neighbor(self) -> Optional[str]:
         """Get next server in ring (clockwise neighbor)"""
@@ -821,7 +836,13 @@ class Server:
         
         # Send election message with our ID as candidate
         # Using multicast but with target_id for ring semantics
-        election_msg = LeaderElectionMessage(self.server_id, self.server_id, self.server_id)
+        election_msg = LeaderElectionMessage(
+            self.server_id,
+            self.server_id,
+            self.server_uuid,
+            self.server_id,
+            self.server_uuid,
+        )
         election_msg.payload['target_id'] = neighbor
         self._send_udp_multicast(election_msg)
         self.logger.info(f"Sent election message to neighbor {neighbor}")
@@ -830,52 +851,93 @@ class Server:
         threading.Thread(target=self._election_timeout, daemon=True).start()
 
     def _handle_election_message(self, msg: Message):
-        """Handle election message - LeLann-Chang-Roberts algorithm"""
+        """Handle election message - LeLann-Chang-Roberts algorithm (UUID-based)."""
         target_id = msg.payload.get('target_id')
-        
+
         # Ring enforcement: only process if message is for us
         if target_id and target_id != self.server_id:
             return
-        
-        candidate_id = msg.payload['candidate_id']
-        initiator_id = msg.payload['initiator_id']
-        
-        self.logger.info(f"Received election msg: candidate={candidate_id}, initiator={initiator_id}")
-        
+
+        candidate_sid = msg.payload.get('candidate_server_id')
+        candidate_uuid = msg.payload.get('candidate_uuid')
+        initiator_sid = msg.payload.get('initiator_server_id')
+        initiator_uuid = msg.payload.get('initiator_uuid')
+
+        cand_int = self._safe_uuid_int(candidate_uuid)
+        my_int = self.server_uuid_int
+
+        self.logger.info(
+            f"Received election msg: candidate={candidate_sid}/{candidate_uuid}, initiator={initiator_sid}/{initiator_uuid}"
+        )
+
         # Mark that we're participating in election
         with self.leader_lock:
             self.election_in_progress = True
             self.election_participant = True
-        
+
         neighbor = self._get_next_neighbor()
-        
-        if candidate_id == self.server_id:
-            # Our ID came back around the ring - we are the leader!
-            self.logger.info("My ID returned - I WIN the election!")
+
+        if candidate_sid == self.server_id and cand_int == my_int:
+            self.logger.info("My UUID returned - I WIN the election!")
             self._become_leader()
-            
-        elif candidate_id > self.server_id:
-            # Candidate has higher ID - forward it
+            return
+
+        if cand_int > my_int:
             if neighbor:
-                fwd_msg = LeaderElectionMessage(self.server_id, candidate_id, initiator_id)
+                fwd_msg = LeaderElectionMessage(
+                    self.server_id,
+                    candidate_sid,
+                    candidate_uuid,
+                    initiator_sid or self.server_id,
+                    initiator_uuid or self.server_uuid,
+                )
                 fwd_msg.payload['target_id'] = neighbor
                 self._send_udp_multicast(fwd_msg)
-                self.logger.info(f"Forwarding higher candidate {candidate_id} to {neighbor}")
-            else:
-                # No neighbor - the candidate should become leader
-                # But we can't forward, so just acknowledge
-                pass
-                
-        elif candidate_id < self.server_id:
-            # Our ID is higher - replace candidate with our ID
+                self.logger.info(f"Forwarding higher candidate {candidate_sid}/{candidate_uuid} to {neighbor}")
+            return
+
+        if cand_int < my_int:
             if neighbor:
-                fwd_msg = LeaderElectionMessage(self.server_id, self.server_id, initiator_id)
+                fwd_msg = LeaderElectionMessage(
+                    self.server_id,
+                    self.server_id,
+                    self.server_uuid,
+                    initiator_sid or self.server_id,
+                    initiator_uuid or self.server_uuid,
+                )
                 fwd_msg.payload['target_id'] = neighbor
                 self._send_udp_multicast(fwd_msg)
-                self.logger.info(f"Replacing with my higher ID {self.server_id}, sending to {neighbor}")
+                self.logger.info(f"Replacing with my higher UUID {self.server_id}/{self.server_uuid}, sending to {neighbor}")
             else:
-                # No neighbor and we're highest - become leader
                 self._become_leader()
+            return
+
+        # Tie-breaker: UUID collision shouldn't happen; fall back to server_id so election terminates.
+        if (candidate_sid or "") > self.server_id:
+            if neighbor:
+                fwd_msg = LeaderElectionMessage(
+                    self.server_id,
+                    candidate_sid,
+                    candidate_uuid,
+                    initiator_sid or self.server_id,
+                    initiator_uuid or self.server_uuid,
+                )
+                fwd_msg.payload['target_id'] = neighbor
+                self._send_udp_multicast(fwd_msg)
+            return
+
+        if neighbor:
+            fwd_msg = LeaderElectionMessage(
+                self.server_id,
+                self.server_id,
+                self.server_uuid,
+                initiator_sid or self.server_id,
+                initiator_uuid or self.server_uuid,
+            )
+            fwd_msg.payload['target_id'] = neighbor
+            self._send_udp_multicast(fwd_msg)
+        else:
+            self._become_leader()
 
     def _become_leader(self):
         """Become the leader and announce to all servers"""
@@ -888,15 +950,17 @@ class Server:
         self.logger.info(f"*** I AM NOW THE LEADER ***")
         
         # Announce to all servers via multicast
-        announcement = LeaderAnnouncementMessage(self.server_id, self.server_id)
+        announcement = LeaderAnnouncementMessage(self.server_id, self.server_id, self.server_uuid)
         self._send_udp_multicast(announcement)
 
     def _handle_leader_announcement(self, msg: Message):
         """Handle leader announcement from winning server"""
-        leader_id = msg.payload['leader_id']
+        leader_id = msg.payload.get('leader_server_id')
+        leader_uuid = msg.payload.get('leader_uuid')
         
         with self.leader_lock:
             self.current_leader = leader_id
+            self.leader_uuid = leader_uuid
             self.election_in_progress = False
             self.election_participant = False
             
@@ -924,7 +988,7 @@ class Server:
                     self.election_participant = False
                     
                     # Announce
-                    announcement = LeaderAnnouncementMessage(self.server_id, self.server_id)
+                    announcement = LeaderAnnouncementMessage(self.server_id, self.server_id, self.server_uuid)
                     self._send_udp_multicast(announcement)
                 else:
                     # Still have neighbors but election didn't complete - retry

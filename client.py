@@ -491,16 +491,33 @@ class Client:
 def main():
     import sys
 
-    if len(sys.argv) < 4:
-        print("Usage: python client.py <client_id> <server_host> <server_port>")
+    if len(sys.argv) < 2:
+        print("Usage: python client.py <client_id> [<server_host> <server_port>]")
+        print("If host/port omitted, the client discovers a server via UDP multicast.")
         sys.exit(1)
 
     client_id = sys.argv[1]
-    host = sys.argv[2]
-    port = int(sys.argv[3])
 
+    # Manual connect mode (kept for debugging)
+    if len(sys.argv) >= 4:
+        host = sys.argv[2]
+        port = int(sys.argv[3])
+        print(f"Connecting to {host}:{port}...")
+        c = Client(client_id, host, port)
+        c.connect(start_receiver=True)
+        c.run_cli()
+        return
+
+    # Auto-discovery mode (no host/port on CLI)
+    print("Discovering server via UDP multicast...")
+    c = Client(client_id, "0.0.0.0", 0)
+    host, port = c.discover_assigned_server()
+    if not host or not port:
+        print("Discovery failed. Start a server and allow UDP 5007 in the firewall, or pass host+port explicitly.")
+        sys.exit(2)
+
+    c.server_host, c.server_port = host, port
     print(f"Connecting to {host}:{port}...")
-    c = Client(client_id, host, port)
     c.connect(start_receiver=True)
     c.run_cli()
 
