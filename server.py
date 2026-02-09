@@ -5,7 +5,6 @@ Features:
 - UDP multicast for server discovery & coordination
 - LeLann-Chang-Roberts (LCR) leader election (Ring topology)
 - Heartbeat-based fault detection
-- Load balancing
 
 According to project requirements:
 - Servers send heartbeats every 2 seconds to all servers (UDP multicast)
@@ -614,9 +613,23 @@ class Server:
         })
 
         try:
-            # Send response to MULTICAST GROUP so client can receive it on their multicast socket
-            self.udp_socket.sendto(resp.to_json().encode('utf-8'), (self.MULTICAST_GROUP, self.MULTICAST_PORT))
-            self.logger.info(f"Responded to client discovery with server {chosen_server_id} at {chosen_host}:{chosen_port}")
+            payload = resp.to_json().encode('utf-8')
+
+            # 1) Unicast reply directly to requester (more reliable on some networks)
+            try:
+                self.udp_socket.sendto(payload, addr)
+            except Exception as e:
+                self.logger.debug(f"Unicast discovery reply failed to {addr}: {e}")
+
+            # 2) Multicast reply for clients listening on the group
+            try:
+                self.udp_socket.sendto(payload, (self.MULTICAST_GROUP, self.MULTICAST_PORT))
+            except Exception as e:
+                self.logger.debug(f"Multicast discovery reply failed: {e}")
+
+            self.logger.info(
+                f"Responded to client discovery with server {chosen_server_id} at {chosen_host}:{chosen_port}"
+            )
         except Exception:
             pass
 
