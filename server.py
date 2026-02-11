@@ -51,12 +51,13 @@ class Server:
         self.max_clients = max_clients
         self.logger = logging.getLogger(f"Server-{server_id}")
 
-        # 1. Alle lokalen IPs sammeln (statt nur einer zu raten)
+        # 1. Alle lokalen IPs sammeln (für Multicast-Empfang auf allen Interfaces)
         self.all_local_ips = self._get_all_local_ips()
         self.logger.info(f"Available Local IPs: {self.all_local_ips}")
         
-        # Fallback, falls Matching fehlschlägt (nehmen wir die erste echte IP)
-        self.interface_ip = self.all_local_ips[0] if self.all_local_ips else '127.0.0.1'
+        # 2. Beste IP für primäres Multicast-SENDEN wählen (keine virtuellen Adapter!)
+        self.interface_ip = self._choose_primary_interface()
+        self.logger.info(f"Primary interface for sending: {self.interface_ip}")
 
         # Globally unique identity for leader election (not lexicographic server_id)
         self.server_uuid = str(uuid.uuid4())
@@ -138,6 +139,74 @@ class Server:
             pass
             
         return ips if ips else ['127.0.0.1']
+    
+    def _choose_primary_interface(self) -> str:
+        """
+        Wählt die beste IP für primäres Multicast-Senden.
+        Priorisiert echte LAN-Adapter über virtuelle (Hyper-V, VirtualBox, Docker).
+        
+        Priorität:
+        1. 192.168.0.x - 192.168.15.x (typische Router/DHCP Ranges)
+        2. 192.168.x.x (anderes LAN)
+        3. 10.x.x.x (größere Netzwerke)
+        4. 172.20.10.x (iPhone Hotspot - echtes Netzwerk!)
+        5. 192.168.43.x (Android Hotspot)
+        6. 192.168.137.x (Windows Mobile Hotspot)
+        7. Alles andere außer bekannte virtuelle Adapter
+        
+        Bekannte virtuelle Adapter (niedrigste Priorität):
+        - 192.168.56.x (VirtualBox Host-Only)
+        - 172.17-31.x.x AUSSER 172.20.10.x (Docker/Hyper-V, aber nicht iPhone!)
+        """
+        if not self.all_local_ips:
+            return '127.0.0.1'
+        
+        def get_priority(ip: str) -> int:
+            """Niedrigere Zahl = höhere Priorität"""
+            parts = ip.split('.')
+            if len(parts) != 4:
+                return 999
+            
+            first = int(parts[0])
+            second = int(parts[1])
+            third = int(parts[2])
+            
+            # VirtualBox Host-Only - sehr niedrige Priorität
+            if ip.startswith("192.168.56."):
+                return 900
+            
+            # Docker/Hyper-V (172.17-31.x) AUSSER iPhone Hotspot (172.20.10.x)
+            if first == 172:
+                if second == 20 and third == 10:
+                    # iPhone Hotspot - gute Priorität!
+                    return 50
+                elif 17 <= second <= 31:
+                    # Docker/Hyper-V
+                    return 800
+            
+            # Typische Router-DHCP Ranges (192.168.0-15.x)
+            if first == 192 and second == 168:
+                if 0 <= third <= 15:
+                    return 10  # Beste Priorität
+                elif third == 43:
+                    # Android Hotspot
+                    return 40
+                elif third == 137:
+                    # Windows Mobile Hotspot
+                    return 45
+                else:
+                    return 20  # Anderes 192.168.x.x LAN
+            
+            # 10.x.x.x Netzwerke (Firmen/größere LANs)
+            if first == 10:
+                return 30
+            
+            # Alles andere
+            return 100
+        
+        # Sortiere nach Priorität und nimm die beste
+        sorted_ips = sorted(self.all_local_ips, key=get_priority)
+        return sorted_ips[0]
     
     def start(self):
         self.is_running = True
@@ -693,19 +762,14 @@ class Server:
     def _handle_client_discovery(self, addr):
         """
         Handle discovery request from client.
-        IMPORTANT: Only the LEADER responds to discovery requests.
-        This prevents race conditions where multiple servers respond and 
-        the client connects to whichever answers first.
-        """
-        # CRITICAL: Only the leader should respond to discovery requests
-        with self.leader_lock:
-            if not self.is_leader:
-                # We're not the leader - silently ignore this discovery request
-                # The leader will respond
-                self.logger.debug(f"Ignoring discovery from {addr} - not leader")
-                return
+        ALLE Server antworten auf Discovery-Requests!
         
-        # Small delay to ensure client is listening on multicast group
+        Begründung: Wenn der Leader auf einem anderen Gerät ist (z.B. anderer Laptop),
+        könnte Multicast zwischen den Geräten nicht zuverlässig funktionieren.
+        Daher antwortet JEDER Server mit seinen eigenen Daten.
+        Der Client nimmt die erste gültige Antwort.
+        """
+        # Small delay to avoid packet collision + ensure client is listening
         time.sleep(0.05)
 
         client_ip = addr[0]
@@ -732,16 +796,20 @@ class Server:
                 best_match_score = score
                 chosen_host = my_ip
         
-        # As leader, we can decide which server the client should connect to
-        # For now, we assign the client to ourselves (the leader)
-        # Future: implement load balancing by assigning to least-loaded server
         chosen_port = self.tcp_port
         chosen_server_id = self.server_id
+        
+        # Include leader info so client knows the cluster state
+        with self.leader_lock:
+            is_leader = self.is_leader
+            leader_id = self.current_leader
 
         resp = Message(MessageType.SERVER_ANNOUNCE, self.server_id, {
             'assigned_host': chosen_host,
             'assigned_tcp_port': chosen_port,
-            'server_id': chosen_server_id
+            'server_id': chosen_server_id,
+            'is_leader': is_leader,
+            'current_leader': leader_id
         })
 
         try:
@@ -759,8 +827,9 @@ class Server:
             except Exception as e:
                 self.logger.debug(f"Multicast discovery reply failed: {e}")
 
+            leader_status = "LEADER" if is_leader else f"follower (leader={leader_id})"
             self.logger.info(
-                f"Leader responding to client discovery: assigned {chosen_server_id} at {chosen_host}:{chosen_port}"
+                f"Responding to client discovery [{leader_status}]: {chosen_server_id} at {chosen_host}:{chosen_port}"
             )
         except Exception:
             pass
