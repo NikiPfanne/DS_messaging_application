@@ -3,7 +3,9 @@ Configuration for the distributed messaging system.
 """
 
 # Server configuration
-DEFAULT_MULTICAST_GROUP = '224.0.0.1'
+# WICHTIG: 239.x.x.x ist "administratively scoped" und wird besser durch 
+# Router/WLAN weitergeleitet als 224.0.0.x (Local Network Control Block)
+DEFAULT_MULTICAST_GROUP = '239.255.255.250'
 DEFAULT_MULTICAST_PORT = 5007
 
 # Timing configuration (in seconds)

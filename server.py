@@ -115,21 +115,29 @@ class Server:
         self.BUFFER_TTL = 60.0
             
     def _get_all_local_ips(self):
-        """Findet alle Netzwerk-IPs des PCs (WLAN, Ethernet)."""
+        """
+        Findet ALLE Netzwerk-IPs des PCs (WLAN, Ethernet, Hotspot, etc.)
+        Keine IP-Filterung! Das funktioniert mit:
+        - Normalem WLAN/LAN
+        - iPhone Hotspot (172.20.10.x)
+        - Android Hotspot (192.168.43.x)
+        - Windows Mobile Hotspot (192.168.137.x)
+        - Jeder anderen Netzwerkkonfiguration
+        
+        Doppelte Pakete werden durch das Deduplizierungs-System (seen_msg_ids) behandelt.
+        """
         ips = []
         try:
             hostname = socket.gethostname()
-            # Holt alle IPs, die dem Hostnamen zugeordnet sind
             _, _, ip_list = socket.gethostbyname_ex(hostname)
             for ip in ip_list:
-                # Filter: Nur Loopback (127.x.x.x) ignorieren. Alles andere ist OK.
-                # Das ist RFC-Standard für "Localhost"
+                # NUR Loopback ignorieren - alles andere ist ein echtes Netzwerk!
                 if not ip.startswith("127."):
                     ips.append(ip)
         except Exception:
             pass
             
-        return ips if ips else ['127.0.0.1']  # Fallback auf Localhost, wenn gar nichts anderes da ist
+        return ips if ips else ['127.0.0.1']
     
     def start(self):
         self.is_running = True
@@ -514,6 +522,14 @@ class Server:
 
     # ==================== UDP COMMUNICATION ====================
     
+    def _get_subnet_broadcast(self, ip: str) -> str:
+        """Berechnet die Subnet-Broadcast-Adresse (z.B. 192.168.0.118 -> 192.168.0.255)"""
+        parts = ip.split('.')
+        if len(parts) == 4:
+            # Annahme: /24 Subnetz (typisch für Heimnetzwerke)
+            return f"{parts[0]}.{parts[1]}.{parts[2]}.255"
+        return '255.255.255.255'
+
     def _send_udp_multicast(self, msg: Message):
         """Send message to all servers via UDP multicast AND broadcast for cross-subnet reach"""
         try:
@@ -534,14 +550,28 @@ class Server:
                 except Exception:
                     pass
             
-            # 3. Also send UDP broadcast as fallback (helps when multicast routing fails)
+            # 3. Subnet-spezifische Broadcasts für jede Interface-IP
+            # Das funktioniert besser als 255.255.255.255 zwischen verschiedenen Geräten
+            broadcast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            broadcast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            
+            sent_broadcasts = set()
+            for ip in self.all_local_ips:
+                try:
+                    subnet_broadcast = self._get_subnet_broadcast(ip)
+                    if subnet_broadcast not in sent_broadcasts:
+                        broadcast_sock.sendto(data, (subnet_broadcast, self.MULTICAST_PORT))
+                        sent_broadcasts.add(subnet_broadcast)
+                except Exception:
+                    pass
+            
+            # 4. Auch globalen Broadcast als letzten Fallback
             try:
-                broadcast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                broadcast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
                 broadcast_sock.sendto(data, ('255.255.255.255', self.MULTICAST_PORT))
-                broadcast_sock.close()
             except Exception:
                 pass
+            
+            broadcast_sock.close()
                 
         except Exception as e:
             self.logger.debug(f"UDP multicast error: {e}")
