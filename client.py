@@ -17,7 +17,7 @@ import logging
 import time
 import uuid
 import struct
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, List
 
 from protocol import Message, MessageType, ClientMessage
 import config  # Import centralized configuration
@@ -350,17 +350,36 @@ class Client:
                     self.logger.warning(f"Reconnect attempt failed: {e}")
                     time.sleep(self.RECONNECT_BACKOFF)
 
+    def _get_all_local_ips(self) -> List[str]:
+        """Get all local IPs (for sending discovery on all interfaces)"""
+        ips = []
+        try:
+            hostname = socket.gethostname()
+            _, _, ip_list = socket.gethostbyname_ex(hostname)
+            for ip in ip_list:
+                if not ip.startswith("127."):
+                    ips.append(ip)
+        except Exception:
+            pass
+        return ips if ips else ['127.0.0.1']
+
+    def _get_subnet_broadcast(self, ip: str) -> str:
+        """Calculate subnet broadcast address (e.g., 192.168.0.118 -> 192.168.0.255)"""
+        parts = ip.split('.')
+        if len(parts) == 4:
+            return f"{parts[0]}.{parts[1]}.{parts[2]}.255"
+        return '255.255.255.255'
+
     def discover_assigned_server(self) -> Tuple[Optional[str], Optional[int]]:
         """
-        Send SERVER_DISCOVERY over UDP multicast and wait for SERVER_ANNOUNCE.
-        Expects leader to answer with:
-          assigned_host, assigned_tcp_port, assigned_server_id
+        Send SERVER_DISCOVERY over UDP multicast AND broadcast, wait for SERVER_ANNOUNCE.
+        Uses same approach as server heartbeats for maximum compatibility.
         """
-        # Create UDP socket for multicast send/recv
+        # Create UDP socket for send/recv
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            # Windows-specific: allow multiple sockets on same port
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             if hasattr(socket, 'SO_REUSEPORT'):
                 try:
                     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
@@ -369,20 +388,19 @@ class Client:
         except Exception:
             pass
 
-        # CRITICAL: Bind to multicast port and interface BEFORE sending
+        # Bind to multicast port to receive responses
         try:
-            # Bind to all interfaces on multicast port
             s.bind(('0.0.0.0', self.MULTICAST_PORT))
             
-            # Join the multicast group
-            mreq = struct.pack('4s4s', 
-                               socket.inet_aton(self.MULTICAST_GROUP), 
-                               socket.inet_aton('0.0.0.0'))
-            s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            # Join multicast group on all interfaces
+            mreq_any = struct.pack('4sl', 
+                                   socket.inet_aton(self.MULTICAST_GROUP), 
+                                   socket.INADDR_ANY)
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq_any)
             
-            self.logger.info(f"Discovery socket bound to {self.MULTICAST_GROUP}:{self.MULTICAST_PORT}")
+            self.logger.info(f"Discovery socket bound to port {self.MULTICAST_PORT}")
         except OSError as e:
-            self.logger.warning(f"Failed to bind multicast socket: {e}")
+            self.logger.warning(f"Failed to bind discovery socket: {e}")
             s.close()
             return None, None
 
@@ -391,26 +409,57 @@ class Client:
         discovery = Message(
             MessageType.SERVER_DISCOVERY,
             self.client_id,
-            {
-                "ts": time.time()
-            }
+            {"ts": time.time()}
         )
+        data_to_send = discovery.to_json().encode("utf-8")
 
-        # Send discovery to multicast group
+        # === SEND DISCOVERY VIA MULTIPLE METHODS (like server heartbeats) ===
+        local_ips = self._get_all_local_ips()
+        self.logger.info(f"Discovery: Local IPs: {local_ips}")
+
+        # 1. Send to multicast group
         try:
-            data_to_send = discovery.to_json().encode("utf-8")
-            self.logger.info(f"Discovery: Sending {len(data_to_send)} bytes to {self.MULTICAST_GROUP}:{self.MULTICAST_PORT}")
-            bytes_sent = s.sendto(data_to_send, (self.MULTICAST_GROUP, self.MULTICAST_PORT))
-            self.logger.info(f"Discovery: Sent {bytes_sent} bytes successfully")
+            s.sendto(data_to_send, (self.MULTICAST_GROUP, self.MULTICAST_PORT))
+            self.logger.info(f"Discovery: Sent to multicast {self.MULTICAST_GROUP}:{self.MULTICAST_PORT}")
         except Exception as e:
-            self.logger.warning(f"Discovery send failed: {e}")
+            self.logger.debug(f"Discovery: Multicast send failed: {e}")
+
+        # 2. Send via each interface (multicast)
+        for ip in local_ips:
             try:
-                s.close()
+                temp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+                temp_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 32)
+                temp_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(ip))
+                temp_sock.sendto(data_to_send, (self.MULTICAST_GROUP, self.MULTICAST_PORT))
+                temp_sock.close()
+                self.logger.debug(f"Discovery: Sent multicast via {ip}")
             except Exception:
                 pass
-            return None, None
 
-        # Wait for announce (filter out own messages)
+        # 3. Send subnet-specific broadcasts
+        broadcast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        broadcast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        
+        sent_broadcasts = set()
+        for ip in local_ips:
+            try:
+                subnet_broadcast = self._get_subnet_broadcast(ip)
+                if subnet_broadcast not in sent_broadcasts:
+                    broadcast_sock.sendto(data_to_send, (subnet_broadcast, self.MULTICAST_PORT))
+                    sent_broadcasts.add(subnet_broadcast)
+                    self.logger.info(f"Discovery: Sent broadcast to {subnet_broadcast}:{self.MULTICAST_PORT}")
+            except Exception as e:
+                self.logger.debug(f"Discovery: Broadcast to {subnet_broadcast} failed: {e}")
+
+        # 4. Global broadcast as fallback
+        try:
+            broadcast_sock.sendto(data_to_send, ('255.255.255.255', self.MULTICAST_PORT))
+            self.logger.info(f"Discovery: Sent global broadcast 255.255.255.255:{self.MULTICAST_PORT}")
+        except Exception:
+            pass
+        broadcast_sock.close()
+
+        # === WAIT FOR RESPONSE ===
         try:
             self.logger.info(f"Discovery: Waiting for response (timeout={self.DISCOVERY_TIMEOUT}s)...")
             while True:

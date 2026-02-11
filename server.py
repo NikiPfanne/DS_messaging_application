@@ -815,17 +815,42 @@ class Server:
         try:
             payload = resp.to_json().encode('utf-8')
 
-            # 1) Unicast reply directly to requester (more reliable on some networks)
+            # 1) Unicast reply directly to requester (most reliable)
             try:
                 self.udp_socket.sendto(payload, addr)
+                self.logger.debug(f"Discovery: Unicast reply to {addr}")
             except Exception as e:
                 self.logger.debug(f"Unicast discovery reply failed to {addr}: {e}")
 
-            # 2) Multicast reply for clients listening on the group
+            # 2) Multicast reply 
             try:
                 self.udp_socket.sendto(payload, (self.MULTICAST_GROUP, self.MULTICAST_PORT))
             except Exception as e:
                 self.logger.debug(f"Multicast discovery reply failed: {e}")
+
+            # 3) Broadcast replies (same approach as heartbeats - for cross-device reach)
+            try:
+                broadcast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                broadcast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                
+                # Subnet-specific broadcast based on client IP
+                client_subnet_broadcast = self._get_subnet_broadcast(client_ip)
+                broadcast_sock.sendto(payload, (client_subnet_broadcast, self.MULTICAST_PORT))
+                
+                # Also our own subnet broadcasts
+                for ip in self.all_local_ips:
+                    subnet_broadcast = self._get_subnet_broadcast(ip)
+                    if subnet_broadcast != client_subnet_broadcast:
+                        try:
+                            broadcast_sock.sendto(payload, (subnet_broadcast, self.MULTICAST_PORT))
+                        except:
+                            pass
+                
+                # Global broadcast fallback
+                broadcast_sock.sendto(payload, ('255.255.255.255', self.MULTICAST_PORT))
+                broadcast_sock.close()
+            except Exception as e:
+                self.logger.debug(f"Broadcast discovery reply failed: {e}")
 
             leader_status = "LEADER" if is_leader else f"follower (leader={leader_id})"
             self.logger.info(
