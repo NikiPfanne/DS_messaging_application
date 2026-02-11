@@ -23,7 +23,6 @@ class MessageType(Enum):
     LEADER_ANNOUNCEMENT = "LEADER_ANNOUNCEMENT"
     SERVER_DISCOVERY = "SERVER_DISCOVERY"
     SERVER_ANNOUNCE = "SERVER_ANNOUNCE"
-    LOAD_INFO = "LOAD_INFO"
     
     # Message delivery
     FORWARD_MESSAGE = "FORWARD_MESSAGE"
@@ -114,47 +113,46 @@ class ServerResponse(Message):
 
 
 class HeartbeatMessage(Message):
-    """Heartbeat message for fault detection"""
-    
-    def __init__(self, sender_id: str, server_port: int, is_leader: bool, load: int):
+    """Heartbeat message for fault detection & discovery"""
+
+    def __init__(self, sender_id: str, server_port: int, is_leader: bool, server_uuid: str):
         payload = {
             'server_port': server_port,
             'is_leader': is_leader,
-            'load': load  # Number of connected clients
+            'server_uuid': server_uuid,
         }
         super().__init__(MessageType.HEARTBEAT, sender_id, payload)
 
 
 class LeaderElectionMessage(Message):
     """Message for LeLann-Chang-Roberts leader election"""
-    
-    def __init__(self, sender_id: str, candidate_id: str, initiator_id: str):
+
+    def __init__(
+        self,
+        sender_id: str,
+        candidate_server_id: str,
+        candidate_uuid: str,
+        initiator_server_id: str,
+        initiator_uuid: str,
+    ):
         payload = {
-            'candidate_id': candidate_id,
-            'initiator_id': initiator_id
+            'candidate_server_id': candidate_server_id,
+            'candidate_uuid': candidate_uuid,
+            'initiator_server_id': initiator_server_id,
+            'initiator_uuid': initiator_uuid,
         }
         super().__init__(MessageType.LEADER_ELECTION, sender_id, payload)
 
 
 class LeaderAnnouncementMessage(Message):
     """Announcement of new leader"""
-    
-    def __init__(self, sender_id: str, leader_id: str):
+
+    def __init__(self, sender_id: str, leader_server_id: str, leader_uuid: str):
         payload = {
-            'leader_id': leader_id
+            'leader_server_id': leader_server_id,
+            'leader_uuid': leader_uuid,
         }
         super().__init__(MessageType.LEADER_ANNOUNCEMENT, sender_id, payload)
-
-
-class LoadInfoMessage(Message):
-    """Load information for load balancing"""
-    
-    def __init__(self, sender_id: str, load: int, capacity: int):
-        payload = {
-            'load': load,
-            'capacity': capacity
-        }
-        super().__init__(MessageType.LOAD_INFO, sender_id, payload)
 
 
 class GapRequestMessage(Message):
@@ -177,3 +175,15 @@ class GapResponseMessage(Message):
             'messages': messages
         }
         super().__init__(MessageType.GAP_RESPONSE, sender_id, payload)
+
+
+class MessageAckMessage(Message):
+    """Acknowledgement for a client message - confirms server received and processed it"""
+
+    def __init__(self, sender_id: str, acked_message_id: str, success: bool = True, info: str = ""):
+        payload = {
+            'acked_message_id': acked_message_id,
+            'success': success,
+            'info': info
+        }
+        super().__init__(MessageType.MESSAGE_ACK, sender_id, payload)
