@@ -175,3 +175,15 @@ class GapResponseMessage(Message):
             'messages': messages
         }
         super().__init__(MessageType.GAP_RESPONSE, sender_id, payload)
+
+
+class MessageAckMessage(Message):
+    """Acknowledgement for a client message - confirms server received and processed it"""
+
+    def __init__(self, sender_id: str, acked_message_id: str, success: bool = True, info: str = ""):
+        payload = {
+            'acked_message_id': acked_message_id,
+            'success': success,
+            'info': info
+        }
+        super().__init__(MessageType.MESSAGE_ACK, sender_id, payload)

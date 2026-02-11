@@ -20,6 +20,7 @@ import struct
 from typing import Optional, Dict, Tuple
 
 from protocol import Message, MessageType, ClientMessage
+import config  # Import centralized configuration
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,13 +29,13 @@ logging.basicConfig(
 
 
 class Client:
-    # Must match server.py
-    MULTICAST_GROUP = "224.0.0.1"
-    MULTICAST_PORT = 5007
+    # Use configuration from config.py for consistency
+    MULTICAST_GROUP = config.DEFAULT_MULTICAST_GROUP
+    MULTICAST_PORT = config.DEFAULT_MULTICAST_PORT
 
-    DISCOVERY_TIMEOUT = 2.0       # seconds to wait for SERVER_ANNOUNCE
-    RECONNECT_BACKOFF = 1.0       # seconds between reconnect attempts
-    MAX_MESSAGE_SIZE = 1024 * 1024
+    DISCOVERY_TIMEOUT = config.UDP_TIMEOUT * 2  # seconds to wait for SERVER_ANNOUNCE
+    RECONNECT_BACKOFF = 1.0                     # seconds between reconnect attempts
+    MAX_MESSAGE_SIZE = config.MAX_MESSAGE_SIZE
 
     def __init__(self, client_id: str, server_host: str, server_port: int):
         self.client_id = client_id
